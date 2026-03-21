@@ -115,7 +115,7 @@ def is_spam_text(text: str) -> bool:
     """
     if not text:
         return False
-    if text in ("[APK_FILE]", "[AUDIO_SPAM]"):
+    if text in ("[APK_FILE]", "[AUDIO_SPAM]", "[LINK_SPAM]"):
         return True
     return bool(BLACKLIST_REGEX.search(text))
 
@@ -131,6 +131,9 @@ def extract_candidate_text(message) -> str | None:
 
     if (message.audio or message.voice) and message.caption:
         return "[AUDIO_SPAM]"
+
+    if contains_link(message):
+        return "[LINK_SPAM]"
 
     text = message.text or message.caption or ""
     if text and BLACKLIST_REGEX.search(text):
@@ -213,7 +216,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = message.text or message.caption or ""
 
     # ---------- TOSS CHECK ----------
-    if TOSS_REGEX.search(text) and not contains_link(message):
+    if TOSS_REGEX.search(text):
         reply_text = (
             "<b>Always Play Toss In Small Limits</b>\n\n"
             "<b>Agr ID Me 10K Hai Toh Toss 1K Se Khelo Only...👆</b>"
