@@ -36,7 +36,7 @@ BLACKLIST = [
     "casino", "stakeid", "stake", "bharosa", "punters", "service",
     "download", "bonus", "circle", "red", "bet",
     "exclusive", "platform", "registed",
-    "khelo", "safe", "betting", "book", "Guranteed", "apk"
+    "khelo", "safe", "betting", "book", "Guranteed", "apk", "aviator", "Cricket", "Luck"
 ]
 
 BLACKLIST_REGEX = re.compile(
