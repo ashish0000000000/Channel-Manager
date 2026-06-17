@@ -332,7 +332,14 @@ def main():
     builder = Application.builder().token(BOT_TOKEN).post_init(init_postgres)
     if _proxy_url:
         logging.getLogger(__name__).info("🌐 Proxy enabled: %s", _proxy_url)
-        builder = builder.request(HTTPXRequest(proxy=_proxy_url))
+        # Both request objects must use the proxy:
+        # - request()            → regular API calls (sendMessage, deleteMessage, etc.)
+        # - get_updates_request() → long-polling getUpdates (must also go through proxy)
+        builder = (
+            builder
+            .request(HTTPXRequest(proxy=_proxy_url))
+            .get_updates_request(HTTPXRequest(proxy=_proxy_url))
+        )
     else:
         logging.getLogger(__name__).info("🌐 No proxy configured — connecting directly.")
     application = builder.build()
