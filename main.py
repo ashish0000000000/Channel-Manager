@@ -5,6 +5,7 @@ import re
 from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
 
 # ================= CONFIG =================
 
@@ -15,6 +16,20 @@ if not BOT_TOKEN:
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is missing.")
+
+# ── Proxy config (optional) ──────────────────────────────────────────────────
+_proxy_host   = os.environ.get("PROXY_HOST")
+_proxy_port   = os.environ.get("PROXY_PORT")
+_proxy_user   = os.environ.get("PROXY_USER")
+_proxy_pass   = os.environ.get("PROXY_PASS")
+_proxy_scheme = os.environ.get("PROXY_SCHEME", "socks5")
+
+_proxy_url = None
+if _proxy_host and _proxy_port:
+    if _proxy_user and _proxy_pass:
+        _proxy_url = f"{_proxy_scheme}://{_proxy_user}:{_proxy_pass}@{_proxy_host}:{_proxy_port}"
+    else:
+        _proxy_url = f"{_proxy_scheme}://{_proxy_host}:{_proxy_port}"
 
 db_pool = None
 
@@ -285,7 +300,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await conn.execute("""
                     UPDATE tracked_msgs
                     SET next_msg_id=$2, next_msg_text=$3, next_msg_force_delete=$4
-                    WHERE channel_id=$1
+                          WHERE channel_id=$1
                 """, channel_id, msg_id, text, force_delete)
 
                 logger.info(
@@ -296,12 +311,13 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ================= ENTRY POINT =================
 
 def main():
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(init_postgres)
-        .build()
-    )
+    builder = Application.builder().token(BOT_TOKEN).post_init(init_postgres)
+    if _proxy_url:
+        logging.getLogger(__name__).info("🌐 Proxy enabled: %s", _proxy_url)
+        builder = builder.request(HTTPXRequest(proxy=_proxy_url))
+    else:
+        logging.getLogger(__name__).info("🌐 No proxy configured — connecting directly.")
+    application = builder.build()
     application.add_handler(
         MessageHandler(filters.ChatType.CHANNEL, handle_channel_post)
     )
