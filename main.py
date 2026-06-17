@@ -135,20 +135,39 @@ async def init_postgres(application: Application):
 
 # ================= HELPERS =================
 
+# Telegram-owned domains — links to these are NOT considered external
+_TELEGRAM_DOMAINS = ("t.me", "telegram.me", "telegram.dog", "t.dog", "telegra.ph")
+
+
+def _is_external_url(url: str) -> bool:
+    """Return True if url is a real external link (not a Telegram link)."""
+    url = url.lower().strip()
+    return bool(url) and not any(d in url for d in _TELEGRAM_DOMAINS)
+
+
+def contains_external_link(message) -> bool:
+    """True if the message contains at least one external (non-Telegram) URL."""
+    for entities in filter(None, [message.entities, message.caption_entities]):
+        for ent in entities:
+            if ent.type == "url":
+                text = message.text or message.caption or ""
+                url = text[ent.offset : ent.offset + ent.length]
+                if _is_external_url(url):
+                    return True
+            elif ent.type == "text_link":
+                if _is_external_url(ent.url or ""):
+                    return True
+    return False
+
+
 def is_poster(message) -> bool:
-    """A poster is a photo/video message that also contains a link."""
+    """
+    A poster = photo or video message whose caption contains
+    at least one external link (not t.me / telegram.me / telegram.dog).
+    """
     if not (message.photo or message.video):
         return False
-    return contains_link(message)
-
-
-def contains_link(message) -> bool:
-    """True if the message contains a URL or Telegram link (entity or raw text)."""
-    for entities in filter(None, [message.entities, message.caption_entities]):
-        if any(ent.type in ("url", "text_link") for ent in entities):
-            return True
-    text = message.text or message.caption or ""
-    return any(token in text.lower() for token in ("http://", "https://", "t.me"))
+    return contains_external_link(message)
 
 
 def has_blacklisted_words(text: str) -> bool:
@@ -158,16 +177,21 @@ def has_blacklisted_words(text: str) -> bool:
     return bool(BLACKLIST_REGEX.search(text))
 
 
-def is_audio_or_voice_with_caption(message) -> bool:
+def should_force_delete(message) -> bool:
     """
-    True if the message is:
-      - an audio file with a caption, OR
-      - a voice message with a caption
+    True if the message below a poster must be deleted regardless of text.
+    Conditions (OR):
+      - voice note
+      - any file/document (APK, etc.)
+      - contains an external link
     """
-    has_caption = bool(message.caption)
-    is_audio    = bool(message.audio)
-    is_voice    = bool(message.voice)
-    return (is_audio or is_voice) and has_caption
+    if message.voice:
+        return True
+    if message.document:
+        return True
+    if contains_external_link(message):
+        return True
+    return False
 
 
 # ================= MAIN HANDLER =================
@@ -195,50 +219,44 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             if row and row["poster_msg_id"]:
                 old_poster_id         = row["poster_msg_id"]
-                old_poster_text       = row["poster_text"] or ""
                 next_msg_id           = row["next_msg_id"]
                 next_msg_text         = row["next_msg_text"] or ""
                 next_msg_force_delete = row["next_msg_force_delete"] or False
 
-                # --- Delete old poster if its caption has blacklisted words ---
-                if has_blacklisted_words(old_poster_text):
-                    try:
-                        await context.bot.delete_message(
-                            chat_id=channel_id,
-                            message_id=old_poster_id
-                        )
-                        logger.info(
-                            "Deleted old poster (channel=%s, msg=%s)", channel_id, old_poster_id
-                        )
-                    except BadRequest as e:
-                        logger.warning(
-                            "Old poster already gone (msg=%s): %s", old_poster_id, e
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "Could not delete old poster (msg=%s): %s", old_poster_id, e
-                        )
-                else:
+                # --- Always delete old poster when a new one arrives ---
+                try:
+                    await context.bot.delete_message(
+                        chat_id=channel_id,
+                        message_id=old_poster_id
+                    )
                     logger.info(
-                        "Old poster kept — no blacklisted words (channel=%s, msg=%s)",
-                        channel_id, old_poster_id
+                        "Deleted old poster (channel=%s, msg=%s)", channel_id, old_poster_id
+                    )
+                except BadRequest as e:
+                    logger.warning(
+                        "Old poster already gone (msg=%s): %s", old_poster_id, e
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Could not delete old poster (msg=%s): %s", old_poster_id, e
                     )
 
                 # --- Delete msg below old poster ---
                 # Delete if ANY ONE of these is true (OR logic):
-                #   1. its text/caption has blacklisted words
-                #   2. it was an audio message with a caption
-                #   3. it was a voice message with a caption
+                #   1. voice note
+                #   2. document / APK
+                #   3. contains external link
+                #   4. contains blacklisted word
                 blacklisted  = has_blacklisted_words(next_msg_text)
-                force_delete = next_msg_force_delete
+                force_delete = next_msg_force_delete  # voice / doc / external link (set at storage time)
 
                 if next_msg_id and (blacklisted or force_delete):
                     if blacklisted and force_delete:
-                        reason = "blacklisted words + audio/voice with caption"
+                        reason = "blacklisted words + voice/doc/external link"
                     elif blacklisted:
                         reason = "blacklisted words"
                     else:
-                        reason = "audio/voice with caption"
+                        reason = "voice/doc/external link"
 
                     try:
                         await context.bot.delete_message(
@@ -259,8 +277,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                         )
                 elif next_msg_id:
                     logger.info(
-                        "Msg below poster kept — not audio/voice with caption and no blacklisted words "
-                        "(channel=%s, msg=%s)", channel_id, next_msg_id
+                        "Msg below poster kept — clean message (channel=%s, msg=%s)",
+                        channel_id, next_msg_id
                     )
 
             # Store the new poster
@@ -295,7 +313,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 and not row["next_msg_id"]
             ):
                 text         = (message.text or message.caption or "")[:500]
-                force_delete = is_audio_or_voice_with_caption(message)
+                force_delete = should_force_delete(message)
 
                 await conn.execute("""
                     UPDATE tracked_msgs
