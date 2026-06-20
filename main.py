@@ -194,6 +194,33 @@ def should_force_delete(message) -> bool:
     return False
 
 
+
+def is_likely_safe_mode_resent(message, stored_poster_text: str = "") -> bool:
+    """
+    True if this photo/video message looks like a safe-mode re-sent version
+    of a poster (Latin chars replaced with Cyrillic homoglyphs, so URL entities
+    are gone but the message is still a photo/video).
+    """
+    if not (message.photo or message.video):
+        return False
+    if contains_external_link(message):
+        return False   # real poster still has a URL entity → not a re-send
+    caption = message.caption or ""
+    if not caption and not stored_poster_text:
+        return True    # photo/video with no caption at all — probably re-sent
+    # Check if a meaningful portion of caption chars are Cyrillic
+    # (safe mode swaps Latin → Cyrillic homoglyphs)
+    cyrillic = sum(1 for c in caption if '\u0400' <= c <= '\u04FF')
+    if caption and cyrillic / len(caption) > 0.08:
+        return True
+    # Fallback: similar length to stored poster text → likely the same content
+    if stored_poster_text and caption:
+        ratio = len(caption) / max(len(stored_poster_text), 1)
+        if 0.7 <= ratio <= 1.4:
+            return True
+    return False
+
+
 # ================= MAIN HANDLER =================
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -303,28 +330,50 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             # Record the message right below the current poster.
             # No deletion here — decision is made when the next poster arrives.
             row = await conn.fetchrow(
-                "SELECT poster_msg_id, next_msg_id FROM tracked_msgs WHERE channel_id=$1",
+                "SELECT poster_msg_id, poster_text, next_msg_id FROM tracked_msgs WHERE channel_id=$1",
                 channel_id
             )
-            if (
-                row
-                and row["poster_msg_id"]
-                and msg_id == row["poster_msg_id"] + 1
-                and not row["next_msg_id"]
-            ):
-                text         = (message.text or message.caption or "")[:500]
-                force_delete = should_force_delete(message)
+            if row and row["poster_msg_id"]:
+                stored_poster_text = row["poster_text"] or ""
 
-                await conn.execute("""
-                    UPDATE tracked_msgs
-                    SET next_msg_id=$2, next_msg_text=$3, next_msg_force_delete=$4
-                          WHERE channel_id=$1
-                """, channel_id, msg_id, text, force_delete)
+                # ── Safe-mode re-sent poster detection ───────────────────────
+                # When the forwarding bot's safe mode fires it deletes the original
+                # poster and re-sends it with Cyrillic homoglyphs (no URL entity).
+                # That re-sent message arrives at poster_msg_id + 1 and looks like
+                # a non-poster photo/video.  We must NOT store it as next_msg —
+                # instead update poster_msg_id so the real spam after it is caught.
+                if is_likely_safe_mode_resent(message, stored_poster_text):
+                    await conn.execute("""
+                        UPDATE tracked_msgs
+                        SET poster_msg_id=$2, next_msg_id=NULL,
+                            next_msg_text=NULL, next_msg_force_delete=FALSE
+                        WHERE channel_id=$1
+                    """, channel_id, msg_id)
+                    logger.info(
+                        "Safe-mode re-sent poster detected — updated tracker "
+                        "(channel=%s, old_id=%s, new_id=%s)",
+                        channel_id, row["poster_msg_id"], msg_id
+                    )
 
-                logger.info(
-                    "Stored msg below poster (channel=%s, msg=%s, force_delete=%s)",
-                    channel_id, msg_id, force_delete
-                )
+                # ── Regular message below the poster ─────────────────────────
+                # Accept any non-poster message that arrives after the poster and
+                # before we already have a next_msg stored.
+                # (Removed strict msg_id == poster_msg_id+1 so it works even if
+                # the poster_msg_id was updated above by safe-mode re-send.)
+                elif not row["next_msg_id"]:
+                    text         = (message.text or message.caption or "")[:500]
+                    force_delete = should_force_delete(message)
+
+                    await conn.execute("""
+                        UPDATE tracked_msgs
+                        SET next_msg_id=$2, next_msg_text=$3, next_msg_force_delete=$4
+                        WHERE channel_id=$1
+                    """, channel_id, msg_id, text, force_delete)
+
+                    logger.info(
+                        "Stored msg below poster (channel=%s, msg=%s, force_delete=%s)",
+                        channel_id, msg_id, force_delete
+                    )
 
 # ================= ENTRY POINT =================
 
