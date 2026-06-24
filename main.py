@@ -1,10 +1,10 @@
 import os
+import asyncio
 import logging
 import asyncpg
 import re
-import httpx
 from telegram import Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
@@ -18,7 +18,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is missing.")
 
-# -- Proxy config (optional) --------------------------------------------------
+# ── Proxy config (optional, with auto-detect) ─────────────────────────────────
 _proxy_host   = os.environ.get("PROXY_HOST")
 _proxy_port   = os.environ.get("PROXY_PORT")
 _proxy_user   = os.environ.get("PROXY_USER")
@@ -39,6 +39,41 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ================= PROXY AUTO-DETECT =================
+
+async def _telegram_reachable_direct() -> bool:
+    """Return True if Telegram DC2 is reachable without a proxy (5 s timeout)."""
+    import ssl
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                "149.154.167.51", 443,
+                ssl=ssl.create_default_context()
+            ),
+            timeout=5.0,
+        )
+        writer.close()
+        try:
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+async def _resolve_proxy_url():
+    """Return the effective proxy URL (None = connect directly)."""
+    if not _proxy_url:
+        logger.info("No proxy configured — connecting directly.")
+        return None
+    logger.info("Proxy configured (%s) — checking direct Telegram connectivity...", _proxy_url)
+    if await _telegram_reachable_direct():
+        logger.info("Telegram reachable directly — skipping proxy for lower latency.")
+        return None
+    logger.info("Telegram not reachable directly — using proxy.")
+    return _proxy_url
 
 # ================= BLACKLIST =================
 
@@ -68,7 +103,8 @@ async def init_postgres(application: Application):
                 poster_text           TEXT,
                 next_msg_id           BIGINT,
                 next_msg_text         TEXT,
-                next_msg_force_delete BOOLEAN DEFAULT FALSE
+                next_msg_force_delete BOOLEAN DEFAULT FALSE,
+                last_below_id         BIGINT
             );
         """)
 
@@ -78,6 +114,7 @@ async def init_postgres(application: Application):
             ("next_msg_id",           "BIGINT"),
             ("next_msg_text",         "TEXT"),
             ("next_msg_force_delete", "BOOLEAN DEFAULT FALSE"),
+            ("last_below_id",         "BIGINT"),
         ]:
             exists = await conn.fetchval("""
                 SELECT COUNT(*) FROM information_schema.columns
@@ -148,7 +185,7 @@ def contains_external_link(message) -> bool:
         for ent in entities:
             if ent.type == "url":
                 text = message.text or message.caption or ""
-                url = text[ent.offset: ent.offset + ent.length]
+                url = text[ent.offset : ent.offset + ent.length]
                 if _is_external_url(url):
                     return True
             elif ent.type == "text_link":
@@ -158,6 +195,7 @@ def contains_external_link(message) -> bool:
 
 
 def is_poster(message) -> bool:
+    """A poster = photo or video with at least one external (non-Telegram) URL."""
     if not (message.photo or message.video):
         return False
     return contains_external_link(message)
@@ -170,6 +208,10 @@ def has_blacklisted_words(text: str) -> bool:
 
 
 def should_force_delete(message) -> bool:
+    """
+    True if this message must be deleted IMMEDIATELY on arrival (don't wait for next poster).
+    Conditions (OR): voice note, document/APK, or external link.
+    """
     if message.voice:
         return True
     if message.document:
@@ -179,72 +221,108 @@ def should_force_delete(message) -> bool:
     return False
 
 
-def _cyrillic_ratio(text: str) -> float:
-    """Fraction of characters that are Cyrillic (safe-mode homoglyphs)."""
-    if not text:
-        return 0.0
-    return sum(1 for c in text if 'Ѐ' <= c <= 'ӿ') / len(text)
-
-
-def is_likely_safe_mode_resent_poster(message, stored_poster_text: str = "") -> bool:
+def is_likely_safe_mode_resent(message, stored_poster_text: str = "") -> bool:
     """
-    True if this photo/video looks like a safe-mode re-sent version of the
-    tracked poster (URL stripped, Latin chars replaced with Cyrillic homoglyphs).
-
-    Reliable indicators only — no broad length-ratio guessing which causes
-    false positives and breaks poster tracking.
+    True if this photo/video is a safe-mode re-sent version of a poster.
+    Deliberately strict to avoid false positives:
+      - Must be photo or video
+      - Must NOT have any external link (real poster still has URL entity)
+      - Caption must have >8% Cyrillic characters OR be empty after a known poster
+    The loose length-ratio fallback was removed (caused false positives).
     """
     if not (message.photo or message.video):
         return False
     if contains_external_link(message):
-        return False   # still has a URL entity -> real poster, not a re-send
+        return False
 
     caption = message.caption or ""
 
-    # Indicator 1: Cyrillic homoglyphs in caption (safe-mode signature)
-    if caption and _cyrillic_ratio(caption) > 0.05:
+    # Empty-caption photo/video right after a tracked poster → likely safe-mode re-sent
+    if not caption and stored_poster_text:
         return True
 
-    # Indicator 2: Caption is completely blank and stored poster also had blank caption
-    # (some forwarding bots strip everything including caption in safe mode)
-    if not caption and not stored_poster_text:
-        return True
+    # Must have a meaningful share of Cyrillic characters
+    if caption:
+        cyrillic = sum(1 for c in caption if 'Ѐ' <= c <= 'ӿ')
+        if cyrillic / len(caption) > 0.08:
+            return True
 
     return False
 
+# ================= DELETE HELPERS =================
 
-def is_likely_safe_mode_resent_next(message, stored_text: str) -> bool:
-    """
-    True if this message looks like a safe-mode re-sent version of the stored
-    next_msg (same content, Cyrillic homoglyphs replacing Latin chars).
-    Used to update next_msg_id when the original spam is deleted + resent.
-    """
-    if not stored_text:
-        return False
-    new_text = message.text or message.caption or ""
-    if not new_text:
-        return False
-    # Must have Cyrillic homoglyphs — that's safe-mode's signature
-    if _cyrillic_ratio(new_text) < 0.05:
-        return False
-    # Similar content length confirms it's the same message resent
-    ratio = len(new_text) / max(len(stored_text), 1)
-    return 0.6 <= ratio <= 1.6
-
-
-# ================= PROXY AUTO-DETECT =================
-
-def _can_reach_telegram_direct(timeout: float = 6.0) -> bool:
-    """
-    Return True if api.telegram.org is reachable without a proxy.
-    Uses a synchronous httpx call so it runs before the event loop starts.
-    """
+async def _safe_delete(bot, channel_id: int, msg_id: int, label: str = "msg") -> bool:
+    """Delete a single message. Returns True on success."""
     try:
-        with httpx.Client(timeout=timeout) as client:
-            client.get("https://api.telegram.org")
-            return True
-    except Exception:
+        await bot.delete_message(chat_id=channel_id, message_id=msg_id)
+        logger.info("Deleted %s (channel=%s, msg=%s)", label, channel_id, msg_id)
+        return True
+    except (BadRequest, Forbidden) as e:
+        err = str(e).lower()
+        if "message to delete not found" in err or "message can't be deleted" in err:
+            logger.warning("Already gone — %s (channel=%s, msg=%s): %s", label, channel_id, msg_id, e)
+        elif "not enough rights" in err or "forbidden" in err or "need administrator" in err or "chat_admin_required" in err:
+            logger.error(
+                "BOT NEEDS ADMIN RIGHTS in channel=%s — make the bot an administrator "
+                "with 'Delete messages' permission.", channel_id
+            )
+        else:
+            logger.warning("Could not delete %s (channel=%s, msg=%s): %s", label, channel_id, msg_id, e)
         return False
+    except RetryAfter as e:
+        logger.warning("Rate-limited deleting %s — retrying after %ss", label, e.retry_after)
+        await asyncio.sleep(e.retry_after + 1)
+        return await _safe_delete(bot, channel_id, msg_id, label)
+    except TimedOut:
+        logger.warning("Timeout deleting %s (channel=%s, msg=%s) — retrying once", label, channel_id, msg_id)
+        await asyncio.sleep(2)
+        return await _safe_delete(bot, channel_id, msg_id, label)
+    except Exception as e:
+        logger.error("Unexpected error deleting %s (channel=%s, msg=%s): %s", label, channel_id, msg_id, e)
+        return False
+
+
+async def _safe_delete_range(bot, channel_id: int, first_id: int, last_id: int) -> None:
+    """
+    Delete all messages with IDs in [first_id, last_id] using deleteMessages
+    (up to 100 per call). Telegram silently ignores non-existent IDs.
+    """
+    if not first_id or not last_id or first_id > last_id:
+        return
+
+    # Guard against accidental huge ranges (>500 messages)
+    if last_id - first_id > 500:
+        logger.warning(
+            "Range %s-%s is >500 msgs — clamping to last 500 (channel=%s)",
+            first_id, last_id, channel_id
+        )
+        first_id = last_id - 499
+
+    all_ids = list(range(first_id, last_id + 1))
+    for i in range(0, len(all_ids), 100):
+        chunk = all_ids[i:i + 100]
+        try:
+            await bot.delete_messages(chat_id=channel_id, message_ids=chunk)
+            logger.info(
+                "Bulk-deleted msgs %s-%s (channel=%s, count=%s)",
+                chunk[0], chunk[-1], channel_id, len(chunk)
+            )
+        except (BadRequest, Forbidden) as e:
+            err = str(e).lower()
+            if "not enough rights" in err or "forbidden" in err or "need administrator" in err or "chat_admin_required" in err:
+                logger.error(
+                    "BOT NEEDS ADMIN RIGHTS in channel=%s — make the bot an administrator "
+                    "with 'Delete messages' permission.", channel_id
+                )
+                return  # No point retrying each chunk if no rights
+            else:
+                logger.warning("Bulk delete failed (channel=%s, %s-%s): %s",
+                               channel_id, chunk[0], chunk[-1], e)
+        except RetryAfter as e:
+            logger.warning("Rate-limited on bulk delete — sleeping %ss", e.retry_after)
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception as e:
+            logger.error("Unexpected error on bulk delete (channel=%s): %s", channel_id, e)
 
 
 # ================= MAIN HANDLER =================
@@ -263,59 +341,33 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     async with db_pool.acquire() as conn:
 
+        # ── Case 1: New poster arrived ────────────────────────────────────────
         if is_poster(message):
-            # ----------------------------------------------------------------
-            # NEW POSTER ARRIVED
-            # ----------------------------------------------------------------
             row = await conn.fetchrow(
-                "SELECT poster_msg_id, poster_text, next_msg_id, "
-                "next_msg_text, next_msg_force_delete "
+                "SELECT poster_msg_id, poster_text, next_msg_id, last_below_id "
                 "FROM tracked_msgs WHERE channel_id=$1",
                 channel_id
             )
 
             if row and row["poster_msg_id"]:
-                old_poster_id         = row["poster_msg_id"]
-                next_msg_id           = row["next_msg_id"]
-                next_msg_text         = row["next_msg_text"] or ""
-                next_msg_force_delete = row["next_msg_force_delete"] or False
+                old_poster_id = row["poster_msg_id"]
+                first_below   = row["next_msg_id"]
+                last_below    = row["last_below_id"] or first_below
 
-                # Always delete old poster
-                try:
-                    await context.bot.delete_message(
-                        chat_id=channel_id, message_id=old_poster_id
-                    )
-                    logger.info("Deleted old poster (ch=%s, msg=%s)", channel_id, old_poster_id)
-                except BadRequest as e:
-                    logger.warning("Old poster already gone (msg=%s): %s", old_poster_id, e)
-                except Exception as e:
-                    logger.error("Could not delete old poster (msg=%s): %s", old_poster_id, e)
+                # Always delete the old poster
+                await _safe_delete(context.bot, channel_id, old_poster_id, "old poster")
 
-                # Delete msg below old poster if it meets any condition
-                blacklisted  = has_blacklisted_words(next_msg_text)
-                force_delete = next_msg_force_delete
-
-                if next_msg_id and (blacklisted or force_delete):
-                    reason = (
-                        "blacklisted+force" if blacklisted and force_delete
-                        else "blacklisted" if blacklisted
-                        else "voice/doc/link"
-                    )
-                    try:
-                        await context.bot.delete_message(
-                            chat_id=channel_id, message_id=next_msg_id
-                        )
-                        logger.info(
-                            "Deleted next_msg (ch=%s, msg=%s, reason=%s)",
-                            channel_id, next_msg_id, reason
-                        )
-                    except BadRequest as e:
-                        logger.warning("next_msg already gone (msg=%s): %s", next_msg_id, e)
-                    except Exception as e:
-                        logger.error("Could not delete next_msg (msg=%s): %s", next_msg_id, e)
-                elif next_msg_id:
+                # Always delete ALL messages tracked below the old poster
+                # (regardless of content — any message between two posters is unwanted)
+                if first_below:
+                    if first_below == last_below:
+                        await _safe_delete(context.bot, channel_id, first_below, "msg below poster")
+                    else:
+                        await _safe_delete_range(context.bot, channel_id, first_below, last_below)
+                else:
                     logger.info(
-                        "next_msg kept — clean (ch=%s, msg=%s)", channel_id, next_msg_id
+                        "No below-poster msg tracked for old poster (channel=%s, poster=%s)",
+                        channel_id, old_poster_id
                     )
 
             # Store the new poster
@@ -323,118 +375,114 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             await conn.execute("""
                 INSERT INTO tracked_msgs(
                     channel_id, poster_msg_id, poster_text,
-                    next_msg_id, next_msg_text, next_msg_force_delete
+                    next_msg_id, next_msg_text, next_msg_force_delete, last_below_id
                 )
-                VALUES($1, $2, $3, NULL, NULL, FALSE)
+                VALUES($1, $2, $3, NULL, NULL, FALSE, NULL)
                 ON CONFLICT(channel_id) DO UPDATE SET
                     poster_msg_id         = EXCLUDED.poster_msg_id,
                     poster_text           = EXCLUDED.poster_text,
                     next_msg_id           = NULL,
                     next_msg_text         = NULL,
-                    next_msg_force_delete = FALSE
+                    next_msg_force_delete = FALSE,
+                    last_below_id         = NULL
             """, channel_id, msg_id, new_poster_text)
 
-            logger.info("New poster tracked (ch=%s, msg=%s)", channel_id, msg_id)
+            logger.info("New poster tracked (channel=%s, msg=%s)", channel_id, msg_id)
 
+        # ── Case 2: Non-poster message ────────────────────────────────────────
         else:
-            # ----------------------------------------------------------------
-            # NON-POSTER MESSAGE
-            # ----------------------------------------------------------------
             row = await conn.fetchrow(
-                "SELECT poster_msg_id, poster_text, next_msg_id, next_msg_text "
+                "SELECT poster_msg_id, poster_text, next_msg_id, last_below_id "
                 "FROM tracked_msgs WHERE channel_id=$1",
                 channel_id
             )
-
-            if not (row and row["poster_msg_id"]):
-                return  # No poster tracked yet — nothing to do
+            if not row or not row["poster_msg_id"]:
+                return  # No poster tracked yet
 
             stored_poster_text = row["poster_text"] or ""
-            stored_next_id     = row["next_msg_id"]
-            stored_next_text   = row["next_msg_text"] or ""
 
-            # -- Case 1: safe-mode re-sent poster (Cyrillic, no URL) ---------
-            # The forwarding bot deleted the original poster and resent it
-            # with Cyrillic homoglyphs so URL entities are gone.
-            # We update poster_msg_id to keep tracking correct.
-            if is_likely_safe_mode_resent_poster(message, stored_poster_text):
+            # ── Safe-mode re-sent poster detection ───────────────────────────
+            if is_likely_safe_mode_resent(message, stored_poster_text):
                 await conn.execute("""
                     UPDATE tracked_msgs
-                    SET poster_msg_id=$2,
-                        next_msg_id=NULL, next_msg_text=NULL, next_msg_force_delete=FALSE
+                    SET poster_msg_id=$2, next_msg_id=NULL,
+                        next_msg_text=NULL, next_msg_force_delete=FALSE,
+                        last_below_id=NULL
                     WHERE channel_id=$1
                 """, channel_id, msg_id)
                 logger.info(
-                    "Safe-mode poster resent — updated tracker "
-                    "(ch=%s, old_id=%s -> new_id=%s)",
+                    "Safe-mode re-sent poster detected — updated tracker "
+                    "(channel=%s, old_poster=%s, new_poster=%s)",
                     channel_id, row["poster_msg_id"], msg_id
                 )
+                return  # explicit return — do NOT track this as a below-poster msg
+
+            # ── Force-delete: act immediately, don't wait for next poster ────
+            if should_force_delete(message):
+                await _safe_delete(
+                    context.bot, channel_id, msg_id, "force-delete msg after poster"
+                )
+                # Still extend tracked range so if more msgs appear they're in range
+                if not row["next_msg_id"]:
+                    text = (message.text or message.caption or "")[:500]
+                    await conn.execute("""
+                        UPDATE tracked_msgs
+                        SET next_msg_id=$2, next_msg_text=$3,
+                            next_msg_force_delete=TRUE, last_below_id=$2
+                        WHERE channel_id=$1
+                    """, channel_id, msg_id, text)
+                else:
+                    await conn.execute(
+                        "UPDATE tracked_msgs SET last_below_id=$2 WHERE channel_id=$1",
+                        channel_id, msg_id
+                    )
                 return
 
-            # -- Case 2: safe-mode re-sent next_msg (Cyrillic, next_msg set) -
-            # The spam below the poster was deleted+resent with Cyrillic.
-            # Update next_msg_id so we delete the resent version later.
-            if stored_next_id and is_likely_safe_mode_resent_next(message, stored_next_text):
-                text         = (message.text or message.caption or "")[:500]
-                force_delete = should_force_delete(message)
+            # ── Regular message below the poster ─────────────────────────────
+            # Track first msg as next_msg_id; extend last_below_id on every msg.
+            # All of [next_msg_id, last_below_id] are deleted when next poster arrives.
+            if not row["next_msg_id"]:
+                text = (message.text or message.caption or "")[:500]
                 await conn.execute("""
                     UPDATE tracked_msgs
-                    SET next_msg_id=$2, next_msg_text=$3, next_msg_force_delete=$4
+                    SET next_msg_id=$2, next_msg_text=$3,
+                        next_msg_force_delete=FALSE, last_below_id=$2
                     WHERE channel_id=$1
-                """, channel_id, msg_id, text, force_delete)
+                """, channel_id, msg_id, text)
                 logger.info(
-                    "Safe-mode next_msg resent — updated tracker "
-                    "(ch=%s, old_id=%s -> new_id=%s)",
-                    channel_id, stored_next_id, msg_id
+                    "Stored first msg below poster (channel=%s, msg=%s)", channel_id, msg_id
                 )
-                return
+            else:
+                await conn.execute(
+                    "UPDATE tracked_msgs SET last_below_id=$2 WHERE channel_id=$1",
+                    channel_id, msg_id
+                )
+                logger.info(
+                    "Extended below-poster range to msg=%s (channel=%s)", msg_id, channel_id
+                )
 
-            # -- Case 3: first message below the poster ----------------------
-            if not stored_next_id:
-                text         = (message.text or message.caption or "")[:500]
-                force_delete = should_force_delete(message)
-                await conn.execute("""
-                    UPDATE tracked_msgs
-                    SET next_msg_id=$2, next_msg_text=$3, next_msg_force_delete=$4
-                    WHERE channel_id=$1
-                """, channel_id, msg_id, text, force_delete)
-                logger.info(
-                    "Stored next_msg (ch=%s, msg=%s, force_delete=%s)",
-                    channel_id, msg_id, force_delete
-                )
 
 # ================= ENTRY POINT =================
 
 def main():
-    # -- Auto-proxy detection -------------------------------------------------
-    # If proxy env vars are set, first check if Telegram is reachable directly.
-    # If yes (e.g. server in India where Telegram is accessible), skip proxy
-    # to avoid unnecessary latency routing through a foreign proxy server.
-    effective_proxy = _proxy_url
-    if _proxy_url:
-        logger.info("Proxy configured (%s). Checking direct connectivity...", _proxy_url)
-        if _can_reach_telegram_direct():
-            logger.info("Telegram reachable directly — skipping proxy for lower latency.")
-            effective_proxy = None
-        else:
-            logger.info("Telegram not reachable directly — using proxy.")
-    else:
-        logger.info("No proxy configured — connecting directly.")
+    async def _build_and_run():
+        effective_proxy = await _resolve_proxy_url()
 
-    builder = Application.builder().token(BOT_TOKEN).post_init(init_postgres)
-    if effective_proxy:
-        builder = (
-            builder
-            .request(HTTPXRequest(proxy=effective_proxy))
-            .get_updates_request(HTTPXRequest(proxy=effective_proxy))
+        builder = Application.builder().token(BOT_TOKEN).post_init(init_postgres)
+        if effective_proxy:
+            builder = (
+                builder
+                .request(HTTPXRequest(proxy=effective_proxy))
+                .get_updates_request(HTTPXRequest(proxy=effective_proxy))
+            )
+        application = builder.build()
+        application.add_handler(
+            MessageHandler(filters.ChatType.CHANNEL, handle_channel_post)
         )
+        logger.info("Bot started successfully.")
+        await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    application = builder.build()
-    application.add_handler(
-        MessageHandler(filters.ChatType.CHANNEL, handle_channel_post)
-    )
-    logger.info("Bot started successfully.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    asyncio.run(_build_and_run())
 
 
 if __name__ == "__main__":
