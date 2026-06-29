@@ -184,16 +184,22 @@ def contains_external_link(message) -> bool:
 
 def is_poster(message) -> bool:
     """
-    A poster = photo or video message whose caption contains
-    at least one external link (not t.me / telegram.me / telegram.dog).
+    A poster = photo or video message that has ALL of:
+      1. A non-empty caption
+      2. At least one external (non-Telegram) link in the caption
     """
     if not (message.photo or message.video):
+        return False
+    if not message.caption:           # must have a caption
         return False
     return contains_external_link(message)
 
 
 def has_blacklisted_words(text: str) -> bool:
-    """True if the text contains any blacklisted word."""
+    """
+    True if text contains ANY blacklisted word (case-insensitive).
+    Even a single match triggers deletion.
+    """
     if not text:
         return False
     return bool(BLACKLIST_REGEX.search(text))
@@ -201,17 +207,20 @@ def has_blacklisted_words(text: str) -> bool:
 
 def should_force_delete(message) -> bool:
     """
-    True if the message below a poster must be deleted regardless of text.
-    Conditions (OR):
-      - voice note
-      - any file/document (APK, etc.)
-      - contains an external link
+    Returns True if the message qualifies as a forced-delete candidate
+    (contributes +1 to the deletion score independent of blacklist words).
+
+    Conditions that count as +1:
+      - audio file (message.audio) — NOT a voice note (message.voice)
+      - any document / APK file (message.document)
+
+    Explicitly NOT counted:
+      - voice notes (message.voice) -- safe, keep them
+      - external links alone         -- not a spam signal by itself
     """
-    if message.voice:
+    if message.audio:       # audio file (mp3/m4a/etc.), NOT a voice note
         return True
-    if message.document:
-        return True
-    if contains_external_link(message):
+    if message.document:    # APK or any other document upload
         return True
     return False
 
@@ -290,22 +299,23 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                         "Could not delete old poster (msg=%s): %s", old_poster_id, e
                     )
 
-                # --- Delete msg below old poster ---
-                # Delete if ANY ONE of these is true (OR logic):
-                #   1. voice note
-                #   2. document / APK
-                #   3. contains external link
-                #   4. contains blacklisted word
+                # --- Delete msg below old poster if ANY condition is met (OR logic) ---
+                #
+                # Condition 1: text/caption contains ANY blacklist word (case-insensitive)
+                # Condition 2: message is a document / APK file
+                # Condition 3: message is an audio file (NOT a voice note)
+                #
+                # One match is enough — delete immediately.
                 blacklisted  = has_blacklisted_words(next_msg_text)
-                force_delete = next_msg_force_delete  # voice / doc / external link (set at storage time)
+                force_delete = next_msg_force_delete  # audio file or document/APK
 
                 if next_msg_id and (blacklisted or force_delete):
                     if blacklisted and force_delete:
-                        reason = "blacklisted words + voice/doc/external link"
+                        reason = "blacklist word(s) + audio/apk"
                     elif blacklisted:
-                        reason = "blacklisted words"
+                        reason = "blacklist word(s)"
                     else:
-                        reason = "voice/doc/external link"
+                        reason = "audio file or document/apk"
 
                     try:
                         await context.bot.delete_message(
@@ -326,7 +336,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                         )
                 elif next_msg_id:
                     logger.info(
-                        "Msg below poster kept — clean message (channel=%s, msg=%s)",
+                        "Msg below poster kept — no blacklist/audio/apk match (channel=%s, msg=%s)",
                         channel_id, next_msg_id
                     )
 
