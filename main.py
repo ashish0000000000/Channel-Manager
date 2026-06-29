@@ -2,6 +2,7 @@ import os
 import logging
 import asyncpg
 import re
+import unicodedata
 from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -61,15 +62,107 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ================= TEXT NORMALIZATION (anti-homoglyph) =================
+#
+# "Safe-mode" bots replace Latin characters with visually identical
+# Unicode lookalikes (Cyrillic, Greek, Fullwidth) so the text doesn't
+# appear in Telegram search — and bypasses naive regex blacklists.
+# We normalize every text string BEFORE checking it.
+
+# 1. Invisible / zero-width characters that are silently inserted
+_INVISIBLE_RE = re.compile(
+    '['
+    '­'            # SOFT HYPHEN
+    '͏'            # COMBINING GRAPHEME JOINER
+    '؜'            # ARABIC LETTER MARK
+    'ᅟᅠ'      # HANGUL FILLER
+    '឴឵'      # KHMER VOWEL INHERENT AQ / AA
+    '᠋-᠍'     # MONGOLIAN FREE VARIATION SELECTORS
+    '​-‏'     # ZERO WIDTH SPACE … RIGHT-TO-LEFT MARK
+    '‪-‮'     # LTR / RTL embedding controls
+    '⁠-⁤'     # WORD JOINER, INVISIBLE PLUS …
+    '⁦-⁯'     # DIRECTIONAL ISOLATES, INHIBIT …
+    'ㅤ'            # HANGUL FILLER
+    '︀-️'     # VARIATION SELECTORS
+    '﻿'            # BOM / ZERO WIDTH NO-BREAK SPACE
+    ']',
+    re.UNICODE
+)
+
+# 2. Homoglyph → ASCII translation table
+#    Covers the most common Cyrillic, Greek, and Fullwidth lookalikes.
+_HOMOGLYPH_TABLE = str.maketrans({
+    # ── Cyrillic ──────────────────────────────
+    'а': 'a', 'А': 'A',
+    'в': 'b', 'В': 'B',
+    'с': 'c', 'С': 'C',
+    'е': 'e', 'Е': 'E',
+    'і': 'i', 'І': 'I',
+    'ӏ': 'l',                # Cyrillic palochka
+    'о': 'o', 'О': 'O',
+    'р': 'p', 'Р': 'P',
+    'к': 'k', 'К': 'K',
+    'т': 't', 'Т': 'T',
+    'м': 'm', 'М': 'M',
+    'н': 'h', 'Н': 'H',
+    'у': 'y', 'У': 'Y',
+    'х': 'x', 'Х': 'X',
+    'ѕ': 's', 'Ѕ': 'S',
+    'ј': 'j', 'Ј': 'J',
+    'ч': '4',
+    # ── Greek ─────────────────────────────────
+    'α': 'a', 'Α': 'A',
+    'β': 'b', 'Β': 'B',
+    'ε': 'e', 'Ε': 'E',
+    'ζ': 'z', 'Ζ': 'Z',
+    'η': 'h', 'Η': 'H',
+    'ι': 'i', 'Ι': 'I',
+    'κ': 'k', 'Κ': 'K',
+    'μ': 'u', 'Μ': 'M',
+    'ν': 'v', 'Ν': 'N',
+    'ο': 'o', 'Ο': 'O',
+    'ρ': 'p', 'Ρ': 'P',
+    'τ': 't', 'Τ': 'T',
+    'υ': 'u', 'Υ': 'Y',
+    'χ': 'x', 'Χ': 'X',
+    # ── Fullwidth ASCII (！ … ～) ───────────────
+    **{chr(0xFF01 + i): chr(0x21 + i) for i in range(94)},
+    # ── Lookalike digits ──────────────────────
+    '０': '0', '１': '1', '２': '2', '３': '3', '４': '4',
+    '５': '5', '６': '6', '７': '7', '８': '8', '９': '9',
+})
+
+
+def normalize_text(text: str) -> str:
+    """
+    Convert safe-mode / homoglyph text back to plain ASCII-like text so
+    the blacklist regex can match it.
+
+    Steps:
+      1. NFKC  — collapses compatibility variants (ﬁ→fi, ² →2, ａ→a, …)
+      2. Remove invisible / zero-width characters
+      3. Translate Cyrillic / Greek / Fullwidth homoglyphs → ASCII
+      4. Lowercase (so the caller doesn't need re.IGNORECASE)
+    """
+    if not text:
+        return text
+    text = unicodedata.normalize('NFKC', text)
+    text = _INVISIBLE_RE.sub('', text)
+    text = text.translate(_HOMOGLYPH_TABLE)
+    return text.lower()
+
+
 # ================= BLACKLIST =================
 
 BLACKLIST = [
     "casino", "stakeid", "stake", "bharosa", "punters",
     "download", "bonus", "bet",
     "exclusive", "registed",
-    "khelo", "betting", "Guranteed", "apk", "aviator",
+    "khelo", "betting", "guaranteed", "guranteed", "apk", "aviator",
 ]
 
+# After normalize_text() the input is already lowercase, so IGNORECASE is
+# a safety net only (costs nothing but avoids surprises).
 BLACKLIST_REGEX = re.compile(
     r'\b(?:' + '|'.join(re.escape(w) for w in BLACKLIST) + r')\b',
     re.IGNORECASE
@@ -199,10 +292,17 @@ def has_blacklisted_words(text: str) -> bool:
     """
     True if text contains ANY blacklisted word (case-insensitive).
     Even a single match triggers deletion.
+
+    The text is normalized FIRST to defeat homoglyph / safe-mode evasion:
+    Cyrillic 'а' → 'a', invisible chars removed, fullwidth → ASCII, etc.
     """
     if not text:
         return False
-    return bool(BLACKLIST_REGEX.search(text))
+    normalized = normalize_text(text)
+    matched = bool(BLACKLIST_REGEX.search(normalized))
+    if matched:
+        logger.debug("Blacklist match in normalized text (raw=%r, norm=%r)", text[:80], normalized[:80])
+    return matched
 
 
 def should_force_delete(message) -> bool:
@@ -393,7 +493,10 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 # (Removed strict msg_id == poster_msg_id+1 so it works even if
                 # the poster_msg_id was updated above by safe-mode re-send.)
                 elif not row["next_msg_id"]:
-                    text         = (message.text or message.caption or "")[:500]
+                    raw_text     = (message.text or message.caption or "")
+                    # Normalize before storing so the blacklist check at
+                    # deletion time works even if text used homoglyphs.
+                    text         = normalize_text(raw_text)[:500]
                     force_delete = should_force_delete(message)
 
                     await conn.execute("""
@@ -403,8 +506,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                     """, channel_id, msg_id, text, force_delete)
 
                     logger.info(
-                        "Stored msg below poster (channel=%s, msg=%s, force_delete=%s)",
-                        channel_id, msg_id, force_delete
+                        "Stored msg below poster (channel=%s, msg=%s, force_delete=%s, text_preview=%r)",
+                        channel_id, msg_id, force_delete, text[:60]
                     )
 
 # ================= ENTRY POINT =================
