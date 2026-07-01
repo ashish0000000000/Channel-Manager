@@ -172,7 +172,18 @@ BLACKLIST_REGEX = re.compile(
 
 async def init_postgres(application: Application):
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=2,
+        max_size=10,
+        # Recycle idle connections every 60 s so stale server-side
+        # connections (closed by Postgres after hours of inactivity)
+        # never silently break the pool.
+        max_inactive_connection_lifetime=60.0,
+        # Avoid prepared-statement cache conflicts after a reconnect.
+        statement_cache_size=0,
+        command_timeout=30,
+    )
 
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -329,32 +340,78 @@ def should_force_delete(message) -> bool:
 def is_likely_safe_mode_resent(message, stored_poster_text: str = "") -> bool:
     """
     True if this photo/video message looks like a safe-mode re-sent version
-    of a poster (Latin chars replaced with Cyrillic homoglyphs, so URL entities
-    are gone but the message is still a photo/video).
+    of a poster (Latin chars replaced with Cyrillic homoglyphs, so URL
+    entities are gone but the message is still a photo/video).
+
+    STRICT: only Cyrillic-heavy captions qualify.
+
+    BUG REMOVED -- the old "similar caption length" ratio check (0.7-1.4x)
+    fired on FAR too many innocent channel photos. Any photo with a caption
+    of roughly similar length would be misidentified as a safe-mode resend,
+    causing its message ID to be stored as the tracked poster. The next real
+    poster would then delete that innocent photo instead of the real old poster.
+    The ratio check is now gone. Only a caption with >8% Cyrillic characters
+    triggers detection -- that is the actual fingerprint of safe-mode encoding.
     """
     if not (message.photo or message.video):
         return False
     if contains_external_link(message):
-        return False   # real poster still has a URL entity → not a re-send
+        return False   # still has a real URL entity -- this IS a proper poster
     caption = message.caption or ""
-    if not caption and not stored_poster_text:
-        return True    # photo/video with no caption at all — probably re-sent
-    # Check if a meaningful portion of caption chars are Cyrillic
-    # (safe mode swaps Latin → Cyrillic homoglyphs)
+    if not caption:
+        # A photo/video with no caption at all is NOT treated as a safe-mode
+        # resend -- it is far more likely to be a regular channel photo.
+        return False
+    # Only fire when the caption is visibly Cyrillic-heavy.
+    # Safe-mode bots swap every Latin letter to Cyrillic homoglyph so the
+    # fraction is usually >>50%. We keep 8% to catch lightly-obfuscated text
+    # while staying well clear of normal captions.
     cyrillic = sum(1 for c in caption if '\u0400' <= c <= '\u04FF')
-    if caption and cyrillic / len(caption) > 0.08:
-        return True
-    # Fallback: similar length to stored poster text → likely the same content
-    if stored_poster_text and caption:
-        ratio = len(caption) / max(len(stored_poster_text), 1)
-        if 0.7 <= ratio <= 1.4:
-            return True
-    return False
+    return cyrillic / len(caption) > 0.08
+
+
+# ================= DB HELPER =================
+
+async def _get_db_conn():
+    """
+    Acquire a connection from the pool.
+    If the pool has gone stale (e.g. after a Postgres restart), reinitialise it
+    once and retry so the bot self-heals without needing a manual restart.
+    """
+    global db_pool
+    try:
+        return await db_pool.acquire()
+    except Exception as first_err:
+        logger.warning("DB pool acquire failed (%s) -- reinitialising pool...", first_err)
+        try:
+            await db_pool.close()
+        except Exception:
+            pass
+        db_pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=2,
+            max_size=10,
+            max_inactive_connection_lifetime=60.0,
+            statement_cache_size=0,
+            command_timeout=30,
+        )
+        return await db_pool.acquire()
 
 
 # ================= MAIN HANDLER =================
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Wrap the entire handler so a single bad message never silently kills
+    # processing for all subsequent messages.
+    try:
+        await _handle_channel_post_inner(update, context)
+    except Exception as exc:
+        logger.error(
+            "Unhandled error in handle_channel_post: %s", exc, exc_info=True
+        )
+
+
+async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.channel_post
     if not message:
         return
@@ -526,7 +583,14 @@ def main():
         MessageHandler(filters.ChatType.CHANNEL, handle_channel_post)
     )
     logger.info("Bot started successfully.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        # Never throw away updates that arrived while the bot was restarting.
+        drop_pending_updates=False,
+        # Reconnect quickly if the long-poll connection drops.
+        poll_interval=0.0,
+        timeout=30,
+    )
 
 if __name__ == "__main__":
     main()
