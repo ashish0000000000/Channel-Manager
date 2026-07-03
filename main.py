@@ -2,7 +2,9 @@ import os
 import logging
 import asyncpg
 import re
+import difflib
 import unicodedata
+from urllib.parse import urlparse
 from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -264,27 +266,64 @@ async def init_postgres(application: Application):
 # ================= HELPERS =================
 
 # Telegram-owned domains — links to these are NOT considered external
-_TELEGRAM_DOMAINS = ("t.me", "telegram.me", "telegram.dog", "t.dog", "telegra.ph")
+_TELEGRAM_DOMAINS = ("t.me", "telegram.me", "telegram.dog", "t.dog", "telegra.ph", "telegram.org")
+
+
+def _extract_host(url: str) -> str:
+    """Return the hostname of a URL ('' if unparseable)."""
+    u = url.strip().lower()
+    if "://" not in u:
+        u = "http://" + u
+    try:
+        return urlparse(u).hostname or ""
+    except Exception:
+        return ""
+
+
+def _is_telegram_host(host: str) -> bool:
+    """Exact-domain match (incl. subdomains) — substring tricks like
+    'nott.me-scam.com' or 'evil.com/t.me' do NOT count as Telegram."""
+    return any(host == d or host.endswith("." + d) for d in _TELEGRAM_DOMAINS)
 
 
 def _is_external_url(url: str) -> bool:
     """Return True if url is a real external link (not a Telegram link)."""
-    url = url.lower().strip()
-    return bool(url) and not any(d in url for d in _TELEGRAM_DOMAINS)
+    host = _extract_host(url)
+    return bool(host) and not _is_telegram_host(host)
+
+
+# Plain-text URL fallback — catches obfuscated links that Telegram did NOT
+# turn into url entities (e.g. homoglyph 'ｗｗｗ.ｓｉｔｅ.ｃｏｍ' after
+# normalization). Kept conservative: scheme / www. / bare domain with a
+# common TLD only.
+_URL_IN_TEXT_RE = re.compile(
+    r'(?:https?://|www\.)\S+'
+    r'|\b[a-z0-9][a-z0-9.-]*\.(?:com|net|org|in|io|co|me|app|xyz|site|club|'
+    r'online|top|live|win|vip|bet|link|store|pro|fun|cc|dog|ph)\b(?:/\S*)?'
+)
 
 
 def contains_external_link(message) -> bool:
-    """True if the message contains at least one external (non-Telegram) URL."""
+    """True if the message contains at least one external (non-Telegram) URL.
+
+    Checks (a) real URL entities, then (b) URL-looking strings inside the
+    NORMALIZED text so homoglyph-obfuscated links are also caught.
+    """
+    text = message.text or message.caption or ""
     for entities in filter(None, [message.entities, message.caption_entities]):
         for ent in entities:
             if ent.type == "url":
-                text = message.text or message.caption or ""
                 url = text[ent.offset : ent.offset + ent.length]
                 if _is_external_url(url):
                     return True
             elif ent.type == "text_link":
                 if _is_external_url(ent.url or ""):
                     return True
+    # Fallback: obfuscated / plain-text URLs (safe-mode homoglyph evasion)
+    normalized = normalize_text(text)
+    for m in _URL_IN_TEXT_RE.finditer(normalized):
+        if _is_external_url(m.group(0)):
+            return True
     return False
 
 
@@ -292,13 +331,20 @@ def is_poster(message) -> bool:
     """
     A poster = photo or video message that has ALL of:
       1. A non-empty caption
-      2. At least one external (non-Telegram) link in the caption
+      2. At least ONE blacklisted word in the caption (homoglyph-normalized)
+      3. At least ONE external (non-Telegram) link in the caption
+
+    ALL three must hold — a normal channel photo with a link but no promo
+    words, or promo words but no external link, is NOT a poster and is
+    never touched.
     """
     if not (message.photo or message.video):
         return False
-    if not message.caption:           # must have a caption
+    if not message.caption:                          # must have a caption
         return False
-    return contains_external_link(message)
+    if not has_blacklisted_words(message.caption):   # must have promo words
+        return False
+    return contains_external_link(message)           # must have external link
 
 
 def has_blacklisted_words(text: str) -> bool:
@@ -339,38 +385,60 @@ def should_force_delete(message) -> bool:
     return False
 
 
+def _is_cyrillic_heavy(s: str) -> bool:
+    """True if >8% of chars are Cyrillic — the fingerprint of safe-mode encoding."""
+    if not s:
+        return False
+    return sum(1 for c in s if 'Ѐ' <= c <= 'ӿ') / len(s) > 0.08
+
+
+def _norm_similarity(a: str, b: str) -> float:
+    """Similarity ratio (0..1) between two already-normalized strings."""
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
 
 def is_likely_safe_mode_resent(message, stored_poster_text: str = "") -> bool:
     """
     True if this photo/video message looks like a safe-mode re-sent version
-    of a poster (Latin chars replaced with Cyrillic homoglyphs, so URL
-    entities are gone but the message is still a photo/video).
+    of the TRACKED poster (Latin chars replaced with Cyrillic homoglyphs, so
+    URL entities are gone but the message is still a photo/video).
 
-    STRICT: only Cyrillic-heavy captions qualify.
+    STRICT — ALL must hold:
+      1. The normalized caption contains at least one BLACKLISTED word
+         (after homoglyph decoding — this is the real promo fingerprint).
+      2. The caption is visibly Cyrillic-heavy (>8% Cyrillic chars).
+      3. The normalized caption is SIMILAR (>70%) to the tracked poster's
+         normalized text — a safe-mode resend is the SAME text re-encoded,
+         so similarity is ~1.0. A different spam photo below the poster will
+         NOT match and therefore can never delete the active poster early.
 
-    BUG REMOVED -- the old "similar caption length" ratio check (0.7-1.4x)
-    fired on FAR too many innocent channel photos. Any photo with a caption
-    of roughly similar length would be misidentified as a safe-mode resend,
-    causing its message ID to be stored as the tracked poster. The next real
-    poster would then delete that innocent photo instead of the real old poster.
-    The ratio check is now gone. Only a caption with >8% Cyrillic characters
-    triggers detection -- that is the actual fingerprint of safe-mode encoding.
+    Requiring blacklist + similarity means an innocent Russian/Ukrainian
+    channel photo can NEVER trigger this path — Cyrillic alone is not enough.
     """
     if not (message.photo or message.video):
         return False
     if contains_external_link(message):
-        return False   # still has a real URL entity -- this IS a proper poster
+        return False   # still has a recoverable URL -- handled by the poster path
     caption = message.caption or ""
     if not caption:
         # A photo/video with no caption at all is NOT treated as a safe-mode
         # resend -- it is far more likely to be a regular channel photo.
         return False
-    # Only fire when the caption is visibly Cyrillic-heavy.
-    # Safe-mode bots swap every Latin letter to Cyrillic homoglyph so the
-    # fraction is usually >>50%. We keep 8% to catch lightly-obfuscated text
-    # while staying well clear of normal captions.
-    cyrillic = sum(1 for c in caption if '\u0400' <= c <= '\u04FF')
-    return cyrillic / len(caption) > 0.08
+    # Must contain promo words once homoglyphs are decoded.
+    if not has_blacklisted_words(caption):
+        return False
+    # And must be visibly homoglyph-encoded (Cyrillic-heavy).
+    if not _is_cyrillic_heavy(caption):
+        return False
+    # And must be the SAME text as the tracked poster (re-encoded).
+    if not stored_poster_text:
+        return False
+    return _norm_similarity(
+        normalize_text(caption)[:500],
+        normalize_text(stored_poster_text)[:500]
+    ) > 0.7
 
 
 # ================= DB HELPER =================
@@ -463,19 +531,15 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
 
                 # --- Delete msg below old poster if ANY condition is met (OR logic) ---
                 #
-                # Condition 1: text/caption contains ANY blacklist word (case-insensitive)
-                # Condition 2: message is a document / APK file
-                # Condition 3: message is an audio file (NOT a voice note)
+                # Condition 1: text/caption contains ANY blacklist word
+                # Condition 2: message has an external (non-Telegram) link
+                # Condition 3: message is an audio file / document / APK
+                # Condition 4: message is a voice note with a caption
                 #
                 # One match is enough — delete immediately.
                 blacklisted  = has_blacklisted_words(next_msg_text)
                 force_delete = next_msg_force_delete  # audio file or document/APK
 
-                # Delete below-message if ANY of these match:
-                #   - contains a blacklisted word
-                #   - has an external (non-Telegram) link
-                #   - is an audio file / APK document
-                #   - is a voice note with a caption
                 should_delete = blacklisted or next_msg_has_link or force_delete
 
                 if next_msg_id and should_delete:
@@ -514,15 +578,17 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
             await conn.execute("""
                 INSERT INTO tracked_msgs(
                     channel_id, poster_msg_id, poster_text,
-                    next_msg_id, next_msg_text, next_msg_force_delete
+                    next_msg_id, next_msg_text, next_msg_force_delete,
+                    next_msg_has_link
                 )
-                VALUES($1, $2, $3, NULL, NULL, FALSE)
+                VALUES($1, $2, $3, NULL, NULL, FALSE, FALSE)
                 ON CONFLICT(channel_id) DO UPDATE SET
                     poster_msg_id         = EXCLUDED.poster_msg_id,
                     poster_text           = EXCLUDED.poster_text,
                     next_msg_id           = NULL,
                     next_msg_text         = NULL,
-                    next_msg_force_delete = FALSE
+                    next_msg_force_delete = FALSE,
+                    next_msg_has_link     = FALSE
             """, channel_id, msg_id, new_poster_text)
 
             logger.info("New poster tracked (channel=%s, msg=%s)", channel_id, msg_id)
@@ -531,25 +597,26 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
             # Record the message right below the current poster.
             # No deletion here — decision is made when the next poster arrives.
             row = await conn.fetchrow(
-                "SELECT poster_msg_id, poster_text, next_msg_id FROM tracked_msgs WHERE channel_id=$1",
+                "SELECT poster_msg_id, poster_text, next_msg_id, next_msg_text, "
+                "next_msg_force_delete FROM tracked_msgs WHERE channel_id=$1",
                 channel_id
             )
             if row and row["poster_msg_id"]:
                 stored_poster_text = row["poster_text"] or ""
 
                 # ── Safe-mode re-sent poster detection ───────────────────────
-                # When the forwarding bot's safe mode fires it deletes the original
-                # poster and re-sends it with Cyrillic homoglyphs (no URL entity).
-                # That re-sent message arrives at poster_msg_id + 1 and looks like
-                # a non-poster photo/video.  We must NOT store it as next_msg —
-                # instead update poster_msg_id so the real spam after it is caught.
+                # When the safe-mode bot fires it deletes the original poster
+                # and re-sends it with Cyrillic homoglyphs (no URL entity).
+                # That re-sent message looks like a non-poster photo/video.
+                # We must NOT store it as next_msg — instead update
+                # poster_msg_id so the real spam after it is caught.
                 if is_likely_safe_mode_resent(message, stored_poster_text):
                     old_poster_id   = row["poster_msg_id"]
                     old_next_msg_id = row["next_msg_id"]
 
-                    # Delete the original poster — the auto-forward bot may have
-                    # already deleted it (safe-mode flow), but if it didn't we
-                    # must clean it up ourselves so it doesn't linger in the channel.
+                    # Delete the original poster — the safe-mode bot may have
+                    # already deleted it, but if it didn't we must clean it up
+                    # ourselves so it doesn't linger in the channel.
                     try:
                         await context.bot.delete_message(
                             chat_id=channel_id, message_id=old_poster_id
@@ -579,7 +646,7 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
                                 "Deleted orphaned below-msg on safe-mode resend "
                                 "(channel=%s, msg=%s)", channel_id, old_next_msg_id
                             )
-                        except (BadRequest, Exception):
+                        except Exception:
                             pass
 
                     await conn.execute("""
@@ -596,10 +663,8 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
                     )
 
                 # ── Regular message below the poster ─────────────────────────
-                # Accept any non-poster message that arrives after the poster and
-                # before we already have a next_msg stored.
-                # (Removed strict msg_id == poster_msg_id+1 so it works even if
-                # the poster_msg_id was updated above by safe-mode re-send.)
+                # Accept any non-poster message that arrives after the poster
+                # while no next_msg is stored yet.
                 elif not row["next_msg_id"]:
                     raw_text     = (message.text or message.caption or "")
                     # Normalize before storing so the blacklist check at
@@ -619,6 +684,48 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
                         "Stored msg below poster (channel=%s, msg=%s, force_delete=%s, text_preview=%r)",
                         channel_id, msg_id, force_delete, text[:60]
                     )
+
+                # ── Safe-mode resend of the BELOW message ─────────────────────
+                # The safe-mode bot deletes every admin message and re-sends it
+                # homoglyph-encoded. If we already stored the ORIGINAL below-msg,
+                # its resend arrives while the slot is filled and would be
+                # ignored — the stored msg_id points at an already-deleted
+                # message, so the resend would survive the next cleanup.
+                #
+                # We overwrite the slot ONLY when the new message:
+                #   (a) itself meets a delete condition (blacklist word,
+                #       external link, or apk/audio/voice-with-caption), AND
+                #   (b) carries a resend fingerprint: Cyrillic-heavy text, OR
+                #       >70% similar to the stored below-msg text, OR same
+                #       force-delete media type as the stored one.
+                # (a) guarantees an innocent message is never tracked here.
+                else:
+                    raw  = message.text or message.caption or ""
+                    norm = normalize_text(raw)[:500]
+                    force_delete = should_force_delete(message)
+                    has_link     = contains_external_link(message)
+                    qualifies = (
+                        bool(BLACKLIST_REGEX.search(norm))
+                        or has_link
+                        or force_delete
+                    )
+                    fingerprint = (
+                        _is_cyrillic_heavy(raw)
+                        or _norm_similarity(norm, row["next_msg_text"] or "") > 0.7
+                        or (force_delete and (row["next_msg_force_delete"] or False))
+                    )
+                    if qualifies and fingerprint:
+                        await conn.execute("""
+                            UPDATE tracked_msgs
+                            SET next_msg_id=$2, next_msg_text=$3,
+                                next_msg_force_delete=$4, next_msg_has_link=$5
+                            WHERE channel_id=$1
+                        """, channel_id, msg_id, norm, force_delete, has_link)
+                        logger.info(
+                            "Below-msg safe-mode resend — slot updated "
+                            "(channel=%s, old_id=%s, new_id=%s)",
+                            channel_id, row["next_msg_id"], msg_id
+                        )
 
 # ================= ENTRY POINT =================
 
