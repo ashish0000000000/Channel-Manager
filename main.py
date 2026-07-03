@@ -193,7 +193,8 @@ async def init_postgres(application: Application):
                 poster_text           TEXT,
                 next_msg_id           BIGINT,
                 next_msg_text         TEXT,
-                next_msg_force_delete BOOLEAN DEFAULT FALSE
+                next_msg_force_delete BOOLEAN DEFAULT FALSE,
+                next_msg_has_link     BOOLEAN DEFAULT FALSE
             );
         """)
 
@@ -203,6 +204,7 @@ async def init_postgres(application: Application):
             ("next_msg_id",           "BIGINT"),
             ("next_msg_text",         "TEXT"),
             ("next_msg_force_delete", "BOOLEAN DEFAULT FALSE"),
+            ("next_msg_has_link",     "BOOLEAN DEFAULT FALSE"),
         ]:
             exists = await conn.fetchval("""
                 SELECT COUNT(*) FROM information_schema.columns
@@ -427,7 +429,8 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
 
         if is_poster(message):
             row = await conn.fetchrow(
-                "SELECT poster_msg_id, poster_text, next_msg_id, next_msg_text, next_msg_force_delete "
+                "SELECT poster_msg_id, poster_text, next_msg_id, next_msg_text, "
+                "next_msg_force_delete, next_msg_has_link "
                 "FROM tracked_msgs WHERE channel_id=$1",
                 channel_id
             )
@@ -437,6 +440,7 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
                 next_msg_id           = row["next_msg_id"]
                 next_msg_text         = row["next_msg_text"] or ""
                 next_msg_force_delete = row["next_msg_force_delete"] or False
+                next_msg_has_link     = row["next_msg_has_link"] or False
 
                 # --- Always delete old poster when a new one arrives ---
                 try:
@@ -466,11 +470,18 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
                 blacklisted  = has_blacklisted_words(next_msg_text)
                 force_delete = next_msg_force_delete  # audio file or document/APK
 
-                if next_msg_id and (blacklisted or force_delete):
-                    if blacklisted and force_delete:
-                        reason = "blacklist word(s) + audio/apk"
-                    elif blacklisted:
-                        reason = "blacklist word(s)"
+                # Delete below-message only if:
+                #   - blacklist word AND the message had an external link, OR
+                #   - it was an audio/APK file (force_delete)
+                # A message with ONLY blacklisted words but NO external link is
+                # NOT deleted — it could be a safe-mode re-send of our own poster.
+                should_delete = (blacklisted and next_msg_has_link) or force_delete
+
+                if next_msg_id and should_delete:
+                    if blacklisted and next_msg_has_link and force_delete:
+                        reason = "blacklist word(s) + external link + audio/apk"
+                    elif blacklisted and next_msg_has_link:
+                        reason = "blacklist word(s) + external link"
                     else:
                         reason = "audio file or document/apk"
 
@@ -493,8 +504,9 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
                         )
                 elif next_msg_id:
                     logger.info(
-                        "Msg below poster kept — no blacklist/audio/apk match (channel=%s, msg=%s)",
-                        channel_id, next_msg_id
+                        "Msg below poster kept — no delete condition met "
+                        "(blacklisted=%s, has_link=%s, force_delete=%s, channel=%s, msg=%s)",
+                        blacklisted, next_msg_has_link, force_delete, channel_id, next_msg_id
                     )
 
             # Store the new poster
@@ -555,12 +567,14 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
                     # deletion time works even if text used homoglyphs.
                     text         = normalize_text(raw_text)[:500]
                     force_delete = should_force_delete(message)
+                    has_link     = contains_external_link(message)
 
                     await conn.execute("""
                         UPDATE tracked_msgs
-                        SET next_msg_id=$2, next_msg_text=$3, next_msg_force_delete=$4
+                        SET next_msg_id=$2, next_msg_text=$3,
+                            next_msg_force_delete=$4, next_msg_has_link=$5
                         WHERE channel_id=$1
-                    """, channel_id, msg_id, text, force_delete)
+                    """, channel_id, msg_id, text, force_delete, has_link)
 
                     logger.info(
                         "Stored msg below poster (channel=%s, msg=%s, force_delete=%s, text_preview=%r)",
