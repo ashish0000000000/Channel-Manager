@@ -188,25 +188,31 @@ async def init_postgres(application: Application):
     )
 
     async with db_pool.acquire() as conn:
+        # One row per channel: the currently tracked promo poster.
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS tracked_msgs (
-                channel_id            BIGINT PRIMARY KEY,
-                poster_msg_id         BIGINT,
-                poster_text           TEXT,
-                next_msg_id           BIGINT,
-                next_msg_text         TEXT,
-                next_msg_force_delete BOOLEAN DEFAULT FALSE,
-                next_msg_has_link     BOOLEAN DEFAULT FALSE
+                channel_id    BIGINT PRIMARY KEY,
+                poster_msg_id BIGINT,
+                poster_text   TEXT
+            );
+        """)
+
+        # EVERY qualifying spam message below the current poster.
+        # (Multiple rows per channel — fixes the old single-slot design that
+        # let intermediate safe-mode resends survive the cleanup.)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS below_msgs (
+                channel_id BIGINT NOT NULL,
+                msg_id     BIGINT NOT NULL,
+                reason     TEXT,
+                PRIMARY KEY (channel_id, msg_id)
             );
         """)
 
         # --- Migrations ---
         for col, definition in [
-            ("poster_text",           "TEXT"),
-            ("next_msg_id",           "BIGINT"),
-            ("next_msg_text",         "TEXT"),
-            ("next_msg_force_delete", "BOOLEAN DEFAULT FALSE"),
-            ("next_msg_has_link",     "BOOLEAN DEFAULT FALSE"),
+            ("poster_msg_id", "BIGINT"),
+            ("poster_text",   "TEXT"),
         ]:
             exists = await conn.fetchval("""
                 SELECT COUNT(*) FROM information_schema.columns
@@ -216,47 +222,31 @@ async def init_postgres(application: Application):
                 await conn.execute(f"ALTER TABLE tracked_msgs ADD COLUMN {col} {definition};")
                 logger.info("Migration: added column '%s'", col)
 
-        # Rename old next_msg_is_audio -> next_msg_force_delete if it exists
-        has_old_flag = await conn.fetchval("""
+        # Move any still-tracked single below-msg into the new table, then
+        # drop all legacy columns.
+        has_next_id = await conn.fetchval("""
             SELECT COUNT(*) FROM information_schema.columns
-            WHERE table_name='tracked_msgs' AND column_name='next_msg_is_audio'
+            WHERE table_name='tracked_msgs' AND column_name='next_msg_id'
         """)
-        if has_old_flag:
+        if has_next_id:
             await conn.execute("""
-                UPDATE tracked_msgs
-                SET next_msg_force_delete = next_msg_is_audio
-                WHERE next_msg_force_delete IS NULL OR next_msg_force_delete = FALSE
+                INSERT INTO below_msgs(channel_id, msg_id, reason)
+                SELECT channel_id, next_msg_id, 'migrated'
+                FROM tracked_msgs WHERE next_msg_id IS NOT NULL
+                ON CONFLICT DO NOTHING
             """)
-            await conn.execute("ALTER TABLE tracked_msgs DROP COLUMN next_msg_is_audio;")
-            logger.info("Migration: renamed next_msg_is_audio -> next_msg_force_delete")
+            logger.info("Migration: moved legacy next_msg_id values into below_msgs")
 
-        has_poster_col = await conn.fetchval("""
-            SELECT COUNT(*) FROM information_schema.columns
-            WHERE table_name='tracked_msgs' AND column_name='poster_msg_id'
-        """)
-        if not has_poster_col:
-            await conn.execute("ALTER TABLE tracked_msgs ADD COLUMN poster_msg_id BIGINT;")
-            logger.info("Migration: added poster_msg_id column")
-
-        has_msg_id = await conn.fetchval("""
-            SELECT COUNT(*) FROM information_schema.columns
-            WHERE table_name='tracked_msgs' AND column_name='msg_id'
-        """)
-        if has_msg_id:
-            await conn.execute("""
-                UPDATE tracked_msgs SET poster_msg_id = msg_id WHERE poster_msg_id IS NULL
-            """)
-            await conn.execute("ALTER TABLE tracked_msgs DROP COLUMN msg_id;")
-            logger.info("Migration: moved msg_id -> poster_msg_id")
-
-        for col in ("candidate_id", "candidate_text"):
+        for col in ("next_msg_id", "next_msg_text", "next_msg_force_delete",
+                    "next_msg_has_link", "next_msg_is_audio", "msg_id",
+                    "candidate_id", "candidate_text"):
             has_col = await conn.fetchval("""
                 SELECT COUNT(*) FROM information_schema.columns
                 WHERE table_name='tracked_msgs' AND column_name=$1
             """, col)
             if has_col:
                 await conn.execute(f"ALTER TABLE tracked_msgs DROP COLUMN {col};")
-                logger.info("Migration: dropped stale column '%s'", col)
+                logger.info("Migration: dropped legacy column '%s'", col)
 
         await conn.execute("DROP TABLE IF EXISTS spam_candidates;")
         await conn.execute("DROP TABLE IF EXISTS channel_state;")
@@ -327,6 +317,23 @@ def contains_external_link(message) -> bool:
     return False
 
 
+def has_blacklisted_words(text: str) -> bool:
+    """
+    True if text contains ANY blacklisted word (case-insensitive).
+    Even a single match triggers deletion.
+
+    The text is normalized FIRST to defeat homoglyph / safe-mode evasion:
+    Cyrillic 'а' → 'a', invisible chars removed, fullwidth → ASCII, etc.
+    """
+    if not text:
+        return False
+    normalized = normalize_text(text)
+    matched = bool(BLACKLIST_REGEX.search(normalized))
+    if matched:
+        logger.debug("Blacklist match in normalized text (raw=%r, norm=%r)", text[:80], normalized[:80])
+    return matched
+
+
 def is_poster(message) -> bool:
     """
     A poster = photo or video message that has ALL of:
@@ -347,42 +354,42 @@ def is_poster(message) -> bool:
     return contains_external_link(message)           # must have external link
 
 
-def has_blacklisted_words(text: str) -> bool:
-    """
-    True if text contains ANY blacklisted word (case-insensitive).
-    Even a single match triggers deletion.
-
-    The text is normalized FIRST to defeat homoglyph / safe-mode evasion:
-    Cyrillic 'а' → 'a', invisible chars removed, fullwidth → ASCII, etc.
-    """
-    if not text:
+def _is_apk(document) -> bool:
+    """True only for real APK files (by filename or mime type) — a normal
+    document (PDF, schedule, image file) is NOT deleted on its own."""
+    if not document:
         return False
-    normalized = normalize_text(text)
-    matched = bool(BLACKLIST_REGEX.search(normalized))
-    if matched:
-        logger.debug("Blacklist match in normalized text (raw=%r, norm=%r)", text[:80], normalized[:80])
-    return matched
+    name = (getattr(document, "file_name", "") or "").lower()
+    mime = (getattr(document, "mime_type", "") or "").lower()
+    return name.endswith(".apk") or mime == "application/vnd.android.package-archive"
 
 
-def should_force_delete(message) -> bool:
+def get_delete_reason(message):
     """
-    Returns True if the message type alone warrants deletion (independent
-    of blacklist words or external links).
+    Returns a human-readable reason string if the message meets ANY of the
+    five delete conditions for a message below the poster, else None:
 
-    Conditions:
-      - audio file (message.audio)           — mp3/m4a/etc.
-      - any document / APK (message.document)
-      - voice note WITH a caption (message.voice + message.caption)
-        A plain voice note with no caption is kept; one with a caption
-        is almost always a spam promo.
+      1. one or more blacklisted words (homoglyph-normalized)
+      2. any external (non-Telegram) link
+      3. audio file
+      4. APK file
+      5. voice note WITH a caption
+
+    A message matching NONE of these is never stored and never deleted.
     """
-    if message.audio:                               # audio file
-        return True
-    if message.document:                            # APK or any document
-        return True
-    if message.voice and message.caption:           # voice note with caption
-        return True
-    return False
+    text = message.text or message.caption or ""
+    reasons = []
+    if has_blacklisted_words(text):
+        reasons.append("blacklist word(s)")
+    if contains_external_link(message):
+        reasons.append("external link")
+    if message.audio:
+        reasons.append("audio file")
+    if _is_apk(message.document):
+        reasons.append("apk file")
+    if message.voice and message.caption:
+        reasons.append("voice note with caption")
+    return " + ".join(reasons) if reasons else None
 
 
 def _is_cyrillic_heavy(s: str) -> bool:
@@ -441,34 +448,6 @@ def is_likely_safe_mode_resent(message, stored_poster_text: str = "") -> bool:
     ) > 0.7
 
 
-# ================= DB HELPER =================
-
-async def _get_db_conn():
-    """
-    Acquire a connection from the pool.
-    If the pool has gone stale (e.g. after a Postgres restart), reinitialise it
-    once and retry so the bot self-heals without needing a manual restart.
-    """
-    global db_pool
-    try:
-        return await db_pool.acquire()
-    except Exception as first_err:
-        logger.warning("DB pool acquire failed (%s) -- reinitialising pool...", first_err)
-        try:
-            await db_pool.close()
-        except Exception:
-            pass
-        db_pool = await asyncpg.create_pool(
-            DATABASE_URL,
-            min_size=2,
-            max_size=10,
-            max_inactive_connection_lifetime=60.0,
-            statement_cache_size=0,
-            command_timeout=30,
-        )
-        return await db_pool.acquire()
-
-
 # ================= MAIN HANDLER =================
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -480,6 +459,20 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(
             "Unhandled error in handle_channel_post: %s", exc, exc_info=True
         )
+
+
+async def _delete_msg(bot, channel_id, msg_id, what, reason=""):
+    """Delete one message; downgrade 'already gone' to a warning."""
+    try:
+        await bot.delete_message(chat_id=channel_id, message_id=msg_id)
+        logger.info(
+            "Deleted %s (channel=%s, msg=%s%s)",
+            what, channel_id, msg_id, f", reason={reason}" if reason else ""
+        )
+    except BadRequest as e:
+        logger.warning("%s already gone (msg=%s): %s", what, msg_id, e)
+    except Exception as e:
+        logger.error("Could not delete %s (msg=%s): %s", what, msg_id, e)
 
 
 async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -498,234 +491,102 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
 
         if is_poster(message):
             row = await conn.fetchrow(
-                "SELECT poster_msg_id, poster_text, next_msg_id, next_msg_text, "
-                "next_msg_force_delete, next_msg_has_link "
-                "FROM tracked_msgs WHERE channel_id=$1",
+                "SELECT poster_msg_id FROM tracked_msgs WHERE channel_id=$1",
                 channel_id
             )
 
+            # --- Delete the old poster ---
             if row and row["poster_msg_id"]:
-                old_poster_id         = row["poster_msg_id"]
-                next_msg_id           = row["next_msg_id"]
-                next_msg_text         = row["next_msg_text"] or ""
-                next_msg_force_delete = row["next_msg_force_delete"] or False
-                next_msg_has_link     = row["next_msg_has_link"] or False
+                await _delete_msg(
+                    context.bot, channel_id, row["poster_msg_id"], "old poster"
+                )
 
-                # --- Always delete old poster when a new one arrives ---
-                try:
-                    await context.bot.delete_message(
-                        chat_id=channel_id,
-                        message_id=old_poster_id
-                    )
-                    logger.info(
-                        "Deleted old poster (channel=%s, msg=%s)", channel_id, old_poster_id
-                    )
-                except BadRequest as e:
-                    logger.warning(
-                        "Old poster already gone (msg=%s): %s", old_poster_id, e
-                    )
-                except Exception as e:
-                    logger.error(
-                        "Could not delete old poster (msg=%s): %s", old_poster_id, e
-                    )
+            # --- Delete EVERY recorded qualifying message below the old poster ---
+            below = await conn.fetch(
+                "SELECT msg_id, reason FROM below_msgs WHERE channel_id=$1 ORDER BY msg_id",
+                channel_id
+            )
+            for b in below:
+                await _delete_msg(
+                    context.bot, channel_id, b["msg_id"],
+                    "msg below poster", b["reason"] or ""
+                )
+            if below:
+                await conn.execute(
+                    "DELETE FROM below_msgs WHERE channel_id=$1", channel_id
+                )
 
-                # --- Delete msg below old poster if ANY condition is met (OR logic) ---
-                #
-                # Condition 1: text/caption contains ANY blacklist word
-                # Condition 2: message has an external (non-Telegram) link
-                # Condition 3: message is an audio file / document / APK
-                # Condition 4: message is a voice note with a caption
-                #
-                # One match is enough — delete immediately.
-                blacklisted  = has_blacklisted_words(next_msg_text)
-                force_delete = next_msg_force_delete  # audio file or document/APK
-
-                should_delete = blacklisted or next_msg_has_link or force_delete
-
-                if next_msg_id and should_delete:
-                    reasons = []
-                    if blacklisted:        reasons.append("blacklist word(s)")
-                    if next_msg_has_link:  reasons.append("external link")
-                    if force_delete:       reasons.append("audio/apk/voice-with-caption")
-                    reason = " + ".join(reasons)
-
-                    try:
-                        await context.bot.delete_message(
-                            chat_id=channel_id,
-                            message_id=next_msg_id
-                        )
-                        logger.info(
-                            "Deleted msg below poster (channel=%s, msg=%s, reason=%s)",
-                            channel_id, next_msg_id, reason
-                        )
-                    except BadRequest as e:
-                        logger.warning(
-                            "Msg below poster already gone (msg=%s): %s", next_msg_id, e
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "Could not delete msg below poster (msg=%s): %s", next_msg_id, e
-                        )
-                elif next_msg_id:
-                    logger.info(
-                        "Msg below poster kept — no delete condition met "
-                        "(blacklisted=%s, has_link=%s, force_delete=%s, channel=%s, msg=%s)",
-                        blacklisted, next_msg_has_link, force_delete, channel_id, next_msg_id
-                    )
-
-            # Store the new poster
+            # --- Track the new poster ---
             new_poster_text = (message.caption or message.text or "")[:500]
             await conn.execute("""
-                INSERT INTO tracked_msgs(
-                    channel_id, poster_msg_id, poster_text,
-                    next_msg_id, next_msg_text, next_msg_force_delete,
-                    next_msg_has_link
-                )
-                VALUES($1, $2, $3, NULL, NULL, FALSE, FALSE)
+                INSERT INTO tracked_msgs(channel_id, poster_msg_id, poster_text)
+                VALUES($1, $2, $3)
                 ON CONFLICT(channel_id) DO UPDATE SET
-                    poster_msg_id         = EXCLUDED.poster_msg_id,
-                    poster_text           = EXCLUDED.poster_text,
-                    next_msg_id           = NULL,
-                    next_msg_text         = NULL,
-                    next_msg_force_delete = FALSE,
-                    next_msg_has_link     = FALSE
+                    poster_msg_id = EXCLUDED.poster_msg_id,
+                    poster_text   = EXCLUDED.poster_text
             """, channel_id, msg_id, new_poster_text)
 
             logger.info("New poster tracked (channel=%s, msg=%s)", channel_id, msg_id)
 
         else:
-            # Record the message right below the current poster.
-            # No deletion here — decision is made when the next poster arrives.
             row = await conn.fetchrow(
-                "SELECT poster_msg_id, poster_text, next_msg_id, next_msg_text, "
-                "next_msg_force_delete FROM tracked_msgs WHERE channel_id=$1",
+                "SELECT poster_msg_id, poster_text FROM tracked_msgs WHERE channel_id=$1",
                 channel_id
             )
-            if row and row["poster_msg_id"]:
-                stored_poster_text = row["poster_text"] or ""
+            if not (row and row["poster_msg_id"]):
+                return   # no poster tracked in this channel — never touch anything
 
-                # ── Safe-mode re-sent poster detection ───────────────────────
-                # When the safe-mode bot fires it deletes the original poster
-                # and re-sends it with Cyrillic homoglyphs (no URL entity).
-                # That re-sent message looks like a non-poster photo/video.
-                # We must NOT store it as next_msg — instead update
-                # poster_msg_id so the real spam after it is caught.
-                if is_likely_safe_mode_resent(message, stored_poster_text):
-                    old_poster_id   = row["poster_msg_id"]
-                    old_next_msg_id = row["next_msg_id"]
+            stored_poster_text = row["poster_text"] or ""
 
-                    # Delete the original poster — the safe-mode bot may have
-                    # already deleted it, but if it didn't we must clean it up
-                    # ourselves so it doesn't linger in the channel.
-                    try:
-                        await context.bot.delete_message(
-                            chat_id=channel_id, message_id=old_poster_id
-                        )
-                        logger.info(
-                            "Deleted original poster on safe-mode resend "
-                            "(channel=%s, msg=%s)", channel_id, old_poster_id
-                        )
-                    except BadRequest as e:
-                        logger.warning(
-                            "Original poster already gone on safe-mode resend "
-                            "(msg=%s): %s", old_poster_id, e
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "Could not delete original poster (msg=%s): %s",
-                            old_poster_id, e
-                        )
+            # ── Safe-mode re-sent poster detection ───────────────────────────
+            # The safe-mode bot deletes the original poster and re-sends it
+            # with Cyrillic homoglyphs (no URL entity). That re-sent message
+            # looks like a non-poster photo/video. Move the tracker to it so
+            # the next cleanup deletes the message actually in the channel.
+            if is_likely_safe_mode_resent(message, stored_poster_text):
+                old_poster_id = row["poster_msg_id"]
 
-                    # Also delete any stored below-message (it's now orphaned).
-                    if old_next_msg_id:
-                        try:
-                            await context.bot.delete_message(
-                                chat_id=channel_id, message_id=old_next_msg_id
-                            )
-                            logger.info(
-                                "Deleted orphaned below-msg on safe-mode resend "
-                                "(channel=%s, msg=%s)", channel_id, old_next_msg_id
-                            )
-                        except Exception:
-                            pass
+                # Delete the original poster — the safe-mode bot usually
+                # already did; if not, clean it up ourselves.
+                await _delete_msg(
+                    context.bot, channel_id, old_poster_id,
+                    "original poster (safe-mode resend)"
+                )
 
-                    await conn.execute("""
-                        UPDATE tracked_msgs
-                        SET poster_msg_id=$2, next_msg_id=NULL,
-                            next_msg_text=NULL, next_msg_force_delete=FALSE,
-                            next_msg_has_link=FALSE
-                        WHERE channel_id=$1
-                    """, channel_id, msg_id)
-                    logger.info(
-                        "Safe-mode re-sent poster detected — updated tracker "
-                        "(channel=%s, old_id=%s, new_id=%s)",
-                        channel_id, old_poster_id, msg_id
-                    )
+                await conn.execute("""
+                    UPDATE tracked_msgs
+                    SET poster_msg_id=$2, poster_text=$3
+                    WHERE channel_id=$1
+                """, channel_id, msg_id, (message.caption or "")[:500])
+                logger.info(
+                    "Safe-mode re-sent poster detected — tracker updated "
+                    "(channel=%s, old_id=%s, new_id=%s)",
+                    channel_id, old_poster_id, msg_id
+                )
+                return
 
-                # ── Regular message below the poster ─────────────────────────
-                # Accept any non-poster message that arrives after the poster
-                # while no next_msg is stored yet.
-                elif not row["next_msg_id"]:
-                    raw_text     = (message.text or message.caption or "")
-                    # Normalize before storing so the blacklist check at
-                    # deletion time works even if text used homoglyphs.
-                    text         = normalize_text(raw_text)[:500]
-                    force_delete = should_force_delete(message)
-                    has_link     = contains_external_link(message)
-
-                    await conn.execute("""
-                        UPDATE tracked_msgs
-                        SET next_msg_id=$2, next_msg_text=$3,
-                            next_msg_force_delete=$4, next_msg_has_link=$5
-                        WHERE channel_id=$1
-                    """, channel_id, msg_id, text, force_delete, has_link)
-
-                    logger.info(
-                        "Stored msg below poster (channel=%s, msg=%s, force_delete=%s, text_preview=%r)",
-                        channel_id, msg_id, force_delete, text[:60]
-                    )
-
-                # ── Safe-mode resend of the BELOW message ─────────────────────
-                # The safe-mode bot deletes every admin message and re-sends it
-                # homoglyph-encoded. If we already stored the ORIGINAL below-msg,
-                # its resend arrives while the slot is filled and would be
-                # ignored — the stored msg_id points at an already-deleted
-                # message, so the resend would survive the next cleanup.
-                #
-                # We overwrite the slot ONLY when the new message:
-                #   (a) itself meets a delete condition (blacklist word,
-                #       external link, or apk/audio/voice-with-caption), AND
-                #   (b) carries a resend fingerprint: Cyrillic-heavy text, OR
-                #       >70% similar to the stored below-msg text, OR same
-                #       force-delete media type as the stored one.
-                # (a) guarantees an innocent message is never tracked here.
-                else:
-                    raw  = message.text or message.caption or ""
-                    norm = normalize_text(raw)[:500]
-                    force_delete = should_force_delete(message)
-                    has_link     = contains_external_link(message)
-                    qualifies = (
-                        bool(BLACKLIST_REGEX.search(norm))
-                        or has_link
-                        or force_delete
-                    )
-                    fingerprint = (
-                        _is_cyrillic_heavy(raw)
-                        or _norm_similarity(norm, row["next_msg_text"] or "") > 0.7
-                        or (force_delete and (row["next_msg_force_delete"] or False))
-                    )
-                    if qualifies and fingerprint:
-                        await conn.execute("""
-                            UPDATE tracked_msgs
-                            SET next_msg_id=$2, next_msg_text=$3,
-                                next_msg_force_delete=$4, next_msg_has_link=$5
-                            WHERE channel_id=$1
-                        """, channel_id, msg_id, norm, force_delete, has_link)
-                        logger.info(
-                            "Below-msg safe-mode resend — slot updated "
-                            "(channel=%s, old_id=%s, new_id=%s)",
-                            channel_id, row["next_msg_id"], msg_id
-                        )
+            # ── Message below the poster ─────────────────────────────────────
+            # Record EVERY message that meets a delete condition. Innocent
+            # messages are never recorded, so they can never be deleted.
+            # Safe-mode resends of spam qualify again on arrival and are
+            # simply recorded as additional rows — nothing slips through.
+            reason = get_delete_reason(message)
+            if reason:
+                await conn.execute("""
+                    INSERT INTO below_msgs(channel_id, msg_id, reason)
+                    VALUES($1, $2, $3)
+                    ON CONFLICT DO NOTHING
+                """, channel_id, msg_id, reason)
+                logger.info(
+                    "Recorded msg below poster for deletion (channel=%s, msg=%s, reason=%s, text_preview=%r)",
+                    channel_id, msg_id, reason,
+                    normalize_text(message.text or message.caption or "")[:60]
+                )
+            else:
+                logger.info(
+                    "Msg below poster ignored — no delete condition met "
+                    "(channel=%s, msg=%s)", channel_id, msg_id
+                )
 
 # ================= ENTRY POINT =================
 
