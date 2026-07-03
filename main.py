@@ -320,20 +320,21 @@ def has_blacklisted_words(text: str) -> bool:
 
 def should_force_delete(message) -> bool:
     """
-    Returns True if the message qualifies as a forced-delete candidate
-    (contributes +1 to the deletion score independent of blacklist words).
+    Returns True if the message type alone warrants deletion (independent
+    of blacklist words or external links).
 
-    Conditions that count as +1:
-      - audio file (message.audio) — NOT a voice note (message.voice)
-      - any document / APK file (message.document)
-
-    Explicitly NOT counted:
-      - voice notes (message.voice) -- safe, keep them
-      - external links alone         -- not a spam signal by itself
+    Conditions:
+      - audio file (message.audio)           — mp3/m4a/etc.
+      - any document / APK (message.document)
+      - voice note WITH a caption (message.voice + message.caption)
+        A plain voice note with no caption is kept; one with a caption
+        is almost always a spam promo.
     """
-    if message.audio:       # audio file (mp3/m4a/etc.), NOT a voice note
+    if message.audio:                               # audio file
         return True
-    if message.document:    # APK or any other document upload
+    if message.document:                            # APK or any document
+        return True
+    if message.voice and message.caption:           # voice note with caption
         return True
     return False
 
@@ -470,20 +471,19 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
                 blacklisted  = has_blacklisted_words(next_msg_text)
                 force_delete = next_msg_force_delete  # audio file or document/APK
 
-                # Delete below-message only if:
-                #   - blacklist word AND the message had an external link, OR
-                #   - it was an audio/APK file (force_delete)
-                # A message with ONLY blacklisted words but NO external link is
-                # NOT deleted — it could be a safe-mode re-send of our own poster.
-                should_delete = (blacklisted and next_msg_has_link) or force_delete
+                # Delete below-message if ANY of these match:
+                #   - contains a blacklisted word
+                #   - has an external (non-Telegram) link
+                #   - is an audio file / APK document
+                #   - is a voice note with a caption
+                should_delete = blacklisted or next_msg_has_link or force_delete
 
                 if next_msg_id and should_delete:
-                    if blacklisted and next_msg_has_link and force_delete:
-                        reason = "blacklist word(s) + external link + audio/apk"
-                    elif blacklisted and next_msg_has_link:
-                        reason = "blacklist word(s) + external link"
-                    else:
-                        reason = "audio file or document/apk"
+                    reasons = []
+                    if blacklisted:        reasons.append("blacklist word(s)")
+                    if next_msg_has_link:  reasons.append("external link")
+                    if force_delete:       reasons.append("audio/apk/voice-with-caption")
+                    reason = " + ".join(reasons)
 
                     try:
                         await context.bot.delete_message(
