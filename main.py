@@ -544,16 +544,55 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
                 # a non-poster photo/video.  We must NOT store it as next_msg —
                 # instead update poster_msg_id so the real spam after it is caught.
                 if is_likely_safe_mode_resent(message, stored_poster_text):
+                    old_poster_id   = row["poster_msg_id"]
+                    old_next_msg_id = row["next_msg_id"]
+
+                    # Delete the original poster — the auto-forward bot may have
+                    # already deleted it (safe-mode flow), but if it didn't we
+                    # must clean it up ourselves so it doesn't linger in the channel.
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=channel_id, message_id=old_poster_id
+                        )
+                        logger.info(
+                            "Deleted original poster on safe-mode resend "
+                            "(channel=%s, msg=%s)", channel_id, old_poster_id
+                        )
+                    except BadRequest as e:
+                        logger.warning(
+                            "Original poster already gone on safe-mode resend "
+                            "(msg=%s): %s", old_poster_id, e
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Could not delete original poster (msg=%s): %s",
+                            old_poster_id, e
+                        )
+
+                    # Also delete any stored below-message (it's now orphaned).
+                    if old_next_msg_id:
+                        try:
+                            await context.bot.delete_message(
+                                chat_id=channel_id, message_id=old_next_msg_id
+                            )
+                            logger.info(
+                                "Deleted orphaned below-msg on safe-mode resend "
+                                "(channel=%s, msg=%s)", channel_id, old_next_msg_id
+                            )
+                        except (BadRequest, Exception):
+                            pass
+
                     await conn.execute("""
                         UPDATE tracked_msgs
                         SET poster_msg_id=$2, next_msg_id=NULL,
-                            next_msg_text=NULL, next_msg_force_delete=FALSE
+                            next_msg_text=NULL, next_msg_force_delete=FALSE,
+                            next_msg_has_link=FALSE
                         WHERE channel_id=$1
                     """, channel_id, msg_id)
                     logger.info(
                         "Safe-mode re-sent poster detected — updated tracker "
                         "(channel=%s, old_id=%s, new_id=%s)",
-                        channel_id, row["poster_msg_id"], msg_id
+                        channel_id, old_poster_id, msg_id
                     )
 
                 # ── Regular message below the poster ─────────────────────────
