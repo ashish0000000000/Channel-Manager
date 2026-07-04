@@ -193,22 +193,27 @@ async def init_postgres(application: Application):
         # below_status — what happened directly below the tracked poster:
         #   'open'   : nothing has arrived below the poster yet
         #   'spam'   : the FIRST msg below the poster met a delete condition
-        #              (recorded in below_msgs; its safe-mode resends that
-        #               also qualify get recorded too)
+        #              (recorded in below_msgs; only RESENDS of that same
+        #               message get recorded after it)
         #   'closed' : the FIRST msg below the poster was innocent — the
         #              promoter sent nothing, so NOTHING below this poster
         #              is ever recorded or deleted.
+        #
+        # below_text — normalized text of the FIRST spam msg below the
+        # poster; used to recognize its safe-mode resends (same text
+        # re-encoded with homoglyphs → high similarity after decoding).
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS tracked_msgs (
                 channel_id    BIGINT PRIMARY KEY,
                 poster_msg_id BIGINT,
                 poster_text   TEXT,
-                below_status  TEXT DEFAULT 'open'
+                below_status  TEXT DEFAULT 'open',
+                below_text    TEXT
             );
         """)
 
-        # Every recorded spam message below the current poster
-        # (first qualifying msg + its qualifying safe-mode resends).
+        # The recorded spam below the current poster
+        # (first qualifying msg + its resends only).
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS below_msgs (
                 channel_id BIGINT NOT NULL,
@@ -223,6 +228,7 @@ async def init_postgres(application: Application):
             ("poster_msg_id", "BIGINT"),
             ("poster_text",   "TEXT"),
             ("below_status",  "TEXT DEFAULT 'open'"),
+            ("below_text",    "TEXT"),
         ]:
             exists = await conn.fetchval("""
                 SELECT COUNT(*) FROM information_schema.columns
@@ -362,7 +368,7 @@ def is_poster(message) -> bool:
 
     ALL three must hold — a normal channel photo with a link but no promo
     words, or promo words but no external link, is NOT a poster and is
-    never touched.
+    never touched. A TEXT-ONLY message can never be a poster.
     """
     if not (message.photo or message.video):
         return False
@@ -424,6 +430,30 @@ def _norm_similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def is_below_resend(message, stored_below_text: str) -> bool:
+    """
+    True ONLY if this message looks like a safe-mode RESEND of the first
+    spam message recorded below the poster (same content re-sent, possibly
+    homoglyph-encoded).
+
+    Rules:
+      - both have text: normalized similarity must be >70%
+        (a safe-mode resend is the same text re-encoded → ~1.0)
+      - both have NO text: only a captionless audio/APK counts
+        (a re-sent captionless media file)
+
+    A DIFFERENT message — even one with links or blacklist words — is NOT
+    a resend and must never be recorded or deleted here.
+    """
+    norm = normalize_text(message.text or message.caption or "")[:500]
+    stored = stored_below_text or ""
+    if norm and stored:
+        return _norm_similarity(norm, stored) > 0.7
+    if not norm and not stored:
+        return bool(message.audio or _is_apk(message.document))
+    return False
 
 
 def is_likely_safe_mode_resent(message, stored_poster_text: str = "") -> bool:
@@ -522,7 +552,7 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
                 )
 
             # --- Delete the recorded spam below the old poster (the first
-            #     qualifying msg + its qualifying safe-mode resends) ---
+            #     qualifying msg + its resends) ---
             below = await conn.fetch(
                 "SELECT msg_id, reason FROM below_msgs WHERE channel_id=$1 ORDER BY msg_id",
                 channel_id
@@ -540,19 +570,21 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
             # --- Track the new poster; below-slot re-opens ---
             new_poster_text = (message.caption or message.text or "")[:500]
             await conn.execute("""
-                INSERT INTO tracked_msgs(channel_id, poster_msg_id, poster_text, below_status)
-                VALUES($1, $2, $3, 'open')
+                INSERT INTO tracked_msgs(channel_id, poster_msg_id, poster_text, below_status, below_text)
+                VALUES($1, $2, $3, 'open', NULL)
                 ON CONFLICT(channel_id) DO UPDATE SET
                     poster_msg_id = EXCLUDED.poster_msg_id,
                     poster_text   = EXCLUDED.poster_text,
-                    below_status  = 'open'
+                    below_status  = 'open',
+                    below_text    = NULL
             """, channel_id, msg_id, new_poster_text)
 
             logger.info("New poster tracked (channel=%s, msg=%s)", channel_id, msg_id)
 
         else:
             row = await conn.fetchrow(
-                "SELECT poster_msg_id, poster_text, below_status FROM tracked_msgs WHERE channel_id=$1",
+                "SELECT poster_msg_id, poster_text, below_status, below_text "
+                "FROM tracked_msgs WHERE channel_id=$1",
                 channel_id
             )
             if not (row and row["poster_msg_id"]):
@@ -597,26 +629,25 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
                 # next poster arrives.
                 return
 
-            reason = get_delete_reason(message)
-
             if below_status == "open":
                 # This is the FIRST message below the poster.
+                reason = get_delete_reason(message)
                 if reason:
                     # Promoter's below-msg — record it for deletion.
+                    norm = normalize_text(message.text or message.caption or "")[:500]
                     await conn.execute("""
                         INSERT INTO below_msgs(channel_id, msg_id, reason)
                         VALUES($1, $2, $3)
                         ON CONFLICT DO NOTHING
                     """, channel_id, msg_id, reason)
-                    await conn.execute(
-                        "UPDATE tracked_msgs SET below_status='spam' WHERE channel_id=$1",
-                        channel_id
-                    )
+                    await conn.execute("""
+                        UPDATE tracked_msgs SET below_status='spam', below_text=$2
+                        WHERE channel_id=$1
+                    """, channel_id, norm)
                     logger.info(
                         "Below-msg is promoter spam — recorded for deletion "
                         "(channel=%s, msg=%s, reason=%s, text_preview=%r)",
-                        channel_id, msg_id, reason,
-                        normalize_text(message.text or message.caption or "")[:60]
+                        channel_id, msg_id, reason, norm[:60]
                     )
                 else:
                     # Innocent — promoter sent nothing below this poster.
@@ -633,22 +664,22 @@ async def _handle_channel_post_inner(update: Update, context: ContextTypes.DEFAU
                     )
 
             elif below_status == "spam":
-                # First below-msg already qualified. The safe-mode bot may
-                # delete and re-send it (homoglyph-encoded); those resends
-                # also meet the delete conditions and are recorded too, so
-                # the copy actually left in the channel gets cleaned up.
-                if reason:
+                # First below-msg already qualified. ONLY a resend of that
+                # SAME message (safe-mode re-send: same text homoglyph-encoded,
+                # or the same captionless audio/apk re-sent) is recorded here.
+                # ANY other message — even one containing links or blacklist
+                # words — is left completely alone.
+                if is_below_resend(message, row["below_text"] or ""):
+                    reason = get_delete_reason(message) or "resend of below-msg"
                     await conn.execute("""
                         INSERT INTO below_msgs(channel_id, msg_id, reason)
                         VALUES($1, $2, $3)
                         ON CONFLICT DO NOTHING
                     """, channel_id, msg_id, reason)
                     logger.info(
-                        "Additional promoter spam / resend below poster recorded "
+                        "Safe-mode resend of below-msg recorded "
                         "(channel=%s, msg=%s, reason=%s)", channel_id, msg_id, reason
                     )
-                # Innocent messages arriving in 'spam' state are ignored,
-                # never recorded, never deleted.
 
 # ================= ENTRY POINT =================
 
