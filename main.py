@@ -160,7 +160,7 @@ BLACKLIST = [
     "casino", "stakeid", "stake", "bharosa", "punters",
     "download", "bonus", "bet",
     "exclusive", "registed",
-    "khelo", "betting", "guaranteed", "guranteed", "apk", "aviator",
+    "khelo", "betting", "guaranteed", "guranteed", "apk", "aviator", "khiladi", "book", "withdrawal", "safe", "join", "khelo",
 ]
 
 # After normalize_text() the input is already lowercase, so IGNORECASE is
